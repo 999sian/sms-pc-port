@@ -275,7 +275,7 @@ struct ShaderProgram {
 };
 bool shaderHasEarlyFragmentTests();
 bool earlyZWritesRejected();
-const ShaderProgram* shaderForCurrentState(bool depthOnly = false);
+const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool metric = false);
 void shaderPrepareStage(int stage);  // while a stage loads: its programs (the warm-up)
 
 // ---------------------------------------------------------------- overlay panels

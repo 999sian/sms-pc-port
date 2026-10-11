@@ -34,6 +34,10 @@ void OSPanic(const char* file, int line, const char* msg, ...) {
     abort();
 }
 void DCFlushRange(void* p, u32 n) { GXPC_InvalidateRange(p, uint32_t(n)); }
+extern "C" void port_ptr32_trap(const void* p) {
+    fprintf(stderr, "GX self-test: texture pointer %p is outside emulated memory\n", p);
+    abort();
+}
 
 static int s_fail = 0, s_pass = 0;
 
@@ -151,7 +155,11 @@ static void texSetup() {
     GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 }
 
+#ifdef __ANDROID__
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv) {
+#else
 int main(int argc, char** argv) {
+#endif
     // Assertions need the current EFB, rather than the game's pipelined peeks.
 #ifdef _WIN32
     _putenv_s("SMS_GX_SYNC_READS", "1");
@@ -202,8 +210,12 @@ int main(int argc, char** argv) {
             }
         static std::vector<u8> tex;
         tex = encodeRGBA8(img, 8, 8);
+        // Texture addresses are stored in a 32-bit GX object slot. Keep the
+        // fixture in the same emulated memory window as copied textures.
+        u8* texData = arena + 0x8000;
+        memcpy(texData, tex.data(), tex.size());
         GXTexObj to;
-        GXInitTexObj(&to, tex.data(), 8, 8, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+        GXInitTexObj(&to, texData, 8, 8, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
         GXInitTexObjLOD(&to, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
         GXLoadTexObj(&to, GX_TEXMAP0);
         texSetup();

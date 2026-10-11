@@ -6,6 +6,7 @@
 #include <vector>
 #include "gx_internal.h"
 #include "gx_glthread.h"
+#include "gx_android.h"
 #include <type_traits>
 
 namespace gx { namespace gl {
@@ -19,12 +20,28 @@ SMS_GX_GL_OPTIONAL_FUNCS(SMS_GX_DEFINE)
 // whose GL entry points are __stdcall).
 uint64_t g_statGlCalls = 0;
 #if !(defined(_WIN32) && !defined(_WIN64))
+static PFNGLGETERRORPROC s_rawGetError;
+static bool s_checkErrors;
+static unsigned s_errorLogs;
+static void checkError(const char* name) {
+    if (!s_checkErrors || !strcmp(name, "glGetError")) return;
+    GLenum error = s_rawGetError();
+    if (error != GL_NO_ERROR && s_errorLogs++ < 64)
+        gx::logmsg("GL error 0x%x after %s", unsigned(error), name);
+}
 template <typename F> struct Counted;
 template <typename R, typename... A> struct Counted<R (*)(A...)> {
-    template <R (**Real)(A...), uint64_t* N> static R call(A... a) {
+    template <R (**Real)(A...), uint64_t* N, const char** Name> static R call(A... a) {
         g_statGlCalls++;
         (*N)++;
-        return (*Real)(a...);
+        if constexpr (std::is_void<R>::value) {
+            (*Real)(a...);
+            checkError(*Name);
+        } else {
+            R result = (*Real)(a...);
+            checkError(*Name);
+            return result;
+        }
     }
 };
 struct CallCount {
@@ -64,20 +81,26 @@ bool load(void* (*getProc)(const char*)) {
     bool ok = true;
 #define SMS_GX_LOAD(type, name)                                   \
     gx_##name = reinterpret_cast<type>(getProc(#name));           \
-    if (!gx_##name) { gx::logmsg("GL entry point missing: %s", #name); ok = false; }
+    if (!gx_##name && !gx::android::desktopEntry(#name)) { gx::logmsg("GL entry point missing: %s", #name); ok = false; }
     SMS_GX_GL_FUNCS(SMS_GX_LOAD)
 #undef SMS_GX_LOAD
 #define SMS_GX_LOAD_OPTIONAL(type, name) gx_##name = reinterpret_cast<type>(getProc(#name));
     SMS_GX_GL_OPTIONAL_FUNCS(SMS_GX_LOAD_OPTIONAL)
 #undef SMS_GX_LOAD_OPTIONAL
+#ifdef __ANDROID__
+    if (ok) gx::android::install(getProc);
+#endif
 #if !(defined(_WIN32) && !defined(_WIN64))
-    if (getenv("SMS_GX_STATS")) {
+    s_rawGetError = gx_glGetError;
+    s_checkErrors = getenv("SMS_GX_CHECK_ERRORS") != nullptr;
+    if (getenv("SMS_GX_STATS") || s_checkErrors) {
 #define SMS_GX_WRAP(type, name)                                   \
         {                                                         \
             static type real_##name;                              \
             static uint64_t n_##name;                             \
+            static const char* name_##name = #name;                \
             real_##name = gx_##name;                              \
-            gx_##name = &Counted<type>::template call<&real_##name, &n_##name>; \
+            gx_##name = &Counted<type>::template call<&real_##name, &n_##name, &name_##name>; \
             if (s_nCounts < 256) s_counts[s_nCounts++] = {#name, &n_##name}; \
         }
         SMS_GX_GL_FUNCS(SMS_GX_WRAP)

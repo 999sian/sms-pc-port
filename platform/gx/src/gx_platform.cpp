@@ -269,6 +269,11 @@ bool openWindow(float scale) {
     SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_GAMECUBE", "1");
     SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+#ifdef __ANDROID__
+    // SDL's resizable-window default otherwise overrides the Activity's
+    // landscape orientation with full sensor rotation.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         logmsg("SDL_Init failed: %s", SDL_GetError());
         snprintf(s_windowError, sizeof s_windowError, "%s", SDL_GetError());
@@ -279,8 +284,13 @@ bool openWindow(float scale) {
     // from here on a display exists: a failure is the window's or the context's
     s_windowFailure = WF_WINDOW;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+#ifdef __ANDROID__
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     // Open on the monitor containing the pointer (usually the launcher's Play
     // button). Fall back to the primary display if global coordinates are unavailable.

@@ -23,6 +23,9 @@ set(SMS_GX_SOURCES
     src/gx_texture.cpp
     src/gx_trace.cpp
     src/gx_vert.cpp)
+if(ANDROID)
+    list(APPEND SMS_GX_SOURCES src/gx_android.cpp)
+endif()
 
 # GD is compiled from the decompiled SDK sources: it only emits command bytes.
 set(SMS_GX_GD_SOURCES
@@ -55,8 +58,10 @@ target_include_directories(sms_gx
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 # macOS has no system GL/glcorearb.h; ship Khronos headers under third_party/.
 # The GL thread's waits run the main run loop there (CoreFoundation).
-if(APPLE)
+if(APPLE OR ANDROID)
     target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+endif()
+if(APPLE)
     target_link_libraries(sms_gx PUBLIC "-framework CoreFoundation")
 endif()
 target_compile_features(sms_gx PRIVATE cxx_std_17)
@@ -140,9 +145,13 @@ if(SMS_GX_BUILD_TESTS)
     endif()
     set_source_files_properties(${SMS_GX_MSL_MATH} PROPERTIES COMPILE_OPTIONS "${_sms_gx_msl_opts}"
         INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
-    add_executable(gx_selftest tests/gx_selftest.cpp ${SMS_GX_MSL_MATH} ${SMS_GX_PORT_CHEATS})
-    target_include_directories(gx_selftest PRIVATE ${SMS_GX_DECOMP_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(APPLE)
+    if(ANDROID)
+        add_library(gx_selftest SHARED tests/gx_selftest.cpp ${SMS_GX_MSL_MATH} ${SMS_GX_PORT_CHEATS})
+    else()
+        add_executable(gx_selftest tests/gx_selftest.cpp ${SMS_GX_MSL_MATH} ${SMS_GX_PORT_CHEATS})
+    endif()
+    target_include_directories(gx_selftest PRIVATE ${SMS_GX_TYPES_INCLUDE} ${SMS_GX_DECOMP_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(APPLE OR ANDROID)
         target_include_directories(gx_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     endif()
     target_link_libraries(gx_selftest PRIVATE sms_gx)

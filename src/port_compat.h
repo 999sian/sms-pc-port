@@ -21,6 +21,12 @@
 #include <limits.h>
 #include <float.h>
 #include <wchar.h>
+#ifdef __ANDROID__
+/* Bionic's BSD macros collide with the JASystem methods of these names. */
+#include <strings.h>
+#undef bcopy
+#undef bzero
+#endif
 #ifdef __cplusplus
 #include <new>
 #include <cmath>

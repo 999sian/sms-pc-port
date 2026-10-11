@@ -29,6 +29,7 @@ Fuzzy similarity measures approximate code similarity; the other two tracks show
 | Linux (x86-64) | 64-bit (`SMS_ARCH=64`) | plays; still being tested stage by stage ([docs/64-BIT.md](docs/64-BIT.md)) | `build/linux-64/sms` |
 | macOS (Intel, or Apple Silicon under Rosetta 2) | 64-bit | plays | `build/macos-64/sms` |
 | Windows (MSYS2 MINGW64) | 64-bit | boots under Wine; native runtime checks | `build/windows-64/sms.exe` |
+| Android (ARM64) | 64-bit only | native Android launcher integration ([build notes](docs/ANDROID.md)) | `libsms.so` inside the launcher APK |
 
 The game code keeps pointers in 4-byte fields, so it was written for a 32-bit machine.
 The 64-bit builds keep every address the game sees below 4 GiB; see [docs/64-BIT.md](docs/64-BIT.md).

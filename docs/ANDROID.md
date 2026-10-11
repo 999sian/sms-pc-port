@@ -1,0 +1,53 @@
+# ARM64 Android
+
+Android builds use the native PC port, SDL 2.32.10, and a GLES renderer.
+No GameCube CPU emulation is involved. Build an APK through the Android
+project in the accompanying SMS Launcher checkout; its Android README
+describes the SDK, JDK, install and disc/save import steps.
+
+To compile just the native libraries on a Linux host:
+
+```sh
+export ANDROID_SDK_ROOT=/path/to/android-sdk
+./android/build-native.sh
+```
+
+NDK 28.2.13676358 is the pinned toolchain. The result in
+`build/android-arm64/` includes `libsms.so`, `libsmsbootstrap.so` and
+`SDL2/libSDL2.so`. These libraries run inside SDLActivity; they are not
+standalone shell executables. All Android targets are `arm64-v8a`, PIC,
+and use the NDK's 16 KiB-compatible ELF alignment. The launcher unpacks
+native libraries to permit the bootstrap's explicit game load.
+
+The game remains 64-bit code. The existing decompilation still stores some
+pointers in 32-bit fields, so the bootstrap reserves a low address range
+and loads the game library there with `android_dlopen_ext`. The existing
+MEM1 and low-stack allocators preserve those fields, without changing
+Android's normal address space for SDL, libc, the graphics driver or Java.
+This is an internal layout compatibility constraint, not a 32-bit APK.
+
+GLES 3.1 or newer is required. Base-vertex drawing uses GLES 3.2 or its
+extension when available, with an index-rebasing fallback for GLES 3.1. Shader generation
+uses GLSL ES, with explicit fragment locations and precision. Desktop-only
+depth-range/clear-depth, point-size and multi-draw calls have GLES adapters.
+Color logic operations use a destination snapshot per primitive. Numeric
+pixel metrics use SSBO counters and ordered drawing, preserving counts that
+GLES boolean visibility queries cannot provide. MSAA stays off on Android.
+Clip distances and depth clamp use their GLES extensions when available.
+Without those extensions the vertex shader clamps forward-facing depth;
+this fallback passes the shared graphics tests but is not a substitute for
+testing every scene on each device's driver.
+Depth peeks sample the depth texture into RGB bytes because GLES does not
+permit desktop depth readback. Sampler LOD bias is supplied in the shader.
+
+The renderer adapts the shared GX code rather than maintaining a second
+copy. Desktop paths remain available and should pass the existing GX tests.
+Android crash reports use the NDK unwinder and module offsets in the game
+log, rather than desktop `execinfo` or an external `addr2line` process.
+Resolve offsets offline using the matching unstripped `libsms.so` and the
+NDK's `llvm-addr2line`.
+
+Validation must include installing the actual ARM64 APK, title/file selection,
+an imported save, stage gameplay and unskipped movies. ARM64 translation in
+an Android emulator is suitable for correctness checks, but physical handheld
+testing is still needed for performance, thermal behavior and controller feel.

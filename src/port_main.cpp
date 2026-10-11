@@ -8,6 +8,12 @@
 
 extern void SMS_main(void);
 
+#ifdef __ANDROID__
+// SDLActivity calls this symbol after the bootstrap loads the game library.
+#define main SDL_main
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv);
+#endif
+
 struct Args {
 	int argc;
 	char** argv;

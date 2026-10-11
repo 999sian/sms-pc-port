@@ -4,6 +4,7 @@
 #include "gx_internal.h"
 #include "gl_funcs.h"
 #include "gx_glcache.h"
+#include "gx_android.h"
 #include "gx_glthread.h"
 #include "gx_nis_coef.h"
 #include "sms_gx/gx_pc.h"
@@ -368,6 +369,8 @@ bool rendererReady() { return s_ready; }
 static GLuint compileProgram(const char* vs, const char* fs) {
     auto sh = [](GLenum t, const char* src) {
         GLuint s = glCreateShader(t);
+        std::string adapted = android::shaderSource(src, t);
+        src = adapted.c_str();
         glShaderSource(s, 1, &src, nullptr);
         glCompileShader(s);
         GLint ok = 0;
@@ -2109,6 +2112,60 @@ void flushBatch() {
             else ranges.push_back(Range{vaoForFormat(s_bfmt), iOff + size_t(sg.first) * 4, GLsizei(sg.count), streamBase});
         }
     }
+    #ifdef __ANDROID__
+    if (s_pixActive && android::metricActive()) {
+        const ShaderProgram* metricSp = shaderForCurrentState(false, true);
+        glcUseProgram(metricSp->prog);
+        uploadUniforms(metricSp, texW, texH);
+        const ShaderProgram* depthSp = nullptr;
+        if (earlyFallback) {
+            depthSp = shaderForCurrentState(true);
+            glcUseProgram(depthSp->prog);
+            uploadUniforms(depthSp, texW, texH);
+        }
+        GLboolean masks[4];
+        memcpy(masks, g_glc.cmask, sizeof masks);
+        const GLboolean depthMask = g_glc.depthMask;
+        const uint32_t alphaFunc = (g.bp[BP_ALPHACOMPARE] >> 16) & 0xFF;
+        const bool ordered = earlyFallback || (depthMask && !earlyZWritesRejected() &&
+                                               alphaFunc != 0x3F && alphaFunc != 0x7F);
+        const size_t step = s_bclass == PRIM_TRIS ? 3 : s_bclass == PRIM_LINES ? 2 : 1;
+        // Count each primitive against the depth before its colour draw. The
+        // counter shader uses early tests, but cannot change colour or depth.
+        // The ordinary shader then preserves GX's late/early Z semantics.
+        for (const Range& r : ranges) {
+            glcBindVertexArray(r.vao);
+            if (!ordered) {
+                // Opaque, early-Z and read-only-depth draws can count in the
+                // colour shader itself, preserving the renderer's batching.
+                glcUseProgram(metricSp->prog);
+                glDrawElementsBaseVertex(mode, r.count, GL_UNSIGNED_INT,
+                                         reinterpret_cast<const void*>(r.iOff), r.base);
+                continue;
+            }
+            for (size_t i = 0; i < size_t(r.count); i += step) {
+                const void* indices = reinterpret_cast<const void*>(r.iOff + i * 4);
+                glcUseProgram(metricSp->prog);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glDepthMask(GL_FALSE);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                glcUseProgram(sp->prog);
+                glColorMask(masks[0], masks[1], masks[2], masks[3]);
+                glDepthMask(earlyFallback ? GL_FALSE : depthMask);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                if (earlyFallback) {
+                    glcUseProgram(depthSp->prog);
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                    glDepthMask(GL_TRUE);
+                    glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                }
+            }
+        }
+        glColorMask(masks[0], masks[1], masks[2], masks[3]);
+        glDepthMask(depthMask);
+        glcUseProgram(sp->prog);
+    } else
+    #endif
     if (earlyFallback) {
         const ShaderProgram* depthSp = shaderForCurrentState(true);
         glcUseProgram(depthSp->prog);
@@ -2727,12 +2784,58 @@ static void prefetchPeeks() {
         }
 }
 
+#ifdef __ANDROID__
+// GLES cannot read GL_DEPTH_COMPONENT with glReadPixels. Sample the EFB
+// depth texture into exact RGB bytes, then use the normal RGBA/PBO read path.
+static GLuint androidDepthPeekSource() {
+    static GLuint fbo = 0, texture = 0;
+    static int width = 0;
+    efbReadFbo(0, 0, INT32_MAX, INT32_MAX, GL_DEPTH_BUFFER_BIT);
+    if (!fbo) { glGenFramebuffers(1, &fbo); glGenTextures(1, &texture); }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    if (width != s_efbW) {
+        width = s_efbW;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, EFB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE); glDisable(GL_COLOR_LOGIC_OP);
+    glDisable(GL_CLIP_DISTANCE0); glDisable(GL_CLIP_DISTANCE1);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, width, EFB_H);
+    glUseProgram(s_copyProg);
+    glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0);
+    glBindTexture(GL_TEXTURE_2D, s_efbColor);
+    glActiveTexture(GL_TEXTURE1); glBindSampler(1, 0);
+    glBindTexture(GL_TEXTURE_2D, s_efbDepth);
+    const float rect[4] = {0, 0, 1, 1};
+    glUniform4fv(s_copyURect, 1, rect);
+    glUniform1i(s_copyUMode, 32 | 6);
+    glBindVertexArray(s_copyVao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    return fbo;
+}
+#endif
+
 static uint32_t peekSync(int x, int y, bool depth) {
     glcInvalidate();
     GxTimer tw(&s_waitSeconds);
     s_syncReads++;
     uint32_t v = 0;
     uint8_t px[4] = {0, 0, 0, 0};
+#ifdef __ANDROID__
+    if (depth) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, androidDepthPeekSource());
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+        return uint32_t(px[0]) | uint32_t(px[1]) << 8 | uint32_t(px[2]) << 16;
+    }
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, efbReadFbo(scaled(x), scaled(y), scaled(x) + 1, scaled(y) + 1,
                                                  depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT));
     if (depth) {
@@ -2802,10 +2905,17 @@ static uint32_t peekRaw(int x, int y, bool depth) {
         }
         if (now.fence) glDeleteSync(now.fence);
         glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+#ifdef __ANDROID__
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, depth ? androidDepthPeekSource() : peekSource(false));
+#else
         glBindFramebuffer(GL_READ_FRAMEBUFFER, peekSource(depth));
+#endif
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+#ifndef __ANDROID__
         if (depth) glReadPixels(0, 0, s_efbW, EFB_H, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
-        else glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        else
+#endif
+            glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
         now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -2838,6 +2948,9 @@ uint32_t peekColor(int x, int y) {
 }
 uint32_t peekZ(int x, int y) {
     uint32_t v = peekRaw(x, y, true);
+#ifdef __ANDROID__
+    v = ((v & 0xFF) << 24) | (((v >> 8) & 0xFF) << 16) | (((v >> 16) & 0xFF) << 8);
+#endif
     if (FILE* f = traceFile()) fprintf(f, "  GXPeekZ(%d,%d) = %06X\n", x, y, v >> 8);
     return v >> 8;
 }

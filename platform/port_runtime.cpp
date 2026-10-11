@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <signal.h>
-#include <execinfo.h>
+#include "port_backtrace.h"
 #include "port_host.h"
 #include "disc/gcdisc.h"
 #include "os/crash.h"
@@ -135,6 +135,7 @@ extern "C" void port_stub_report(void)
 // the exact binary at hand. Not async-signal-safe: it runs last, after the
 // rest of the report is written.
 #ifndef _WIN32
+#ifndef __ANDROID__
 static void crash_symbolise(void** bt, int n)
 {
 	char exe[512];
@@ -201,6 +202,7 @@ static void crash_symbolise(void** bt, int n)
 	if (pid > 0)
 		waitpid(pid, nullptr, 0);
 }
+#endif
 
 // Every general register, and what the hardware said about the fault.
 static void crash_registers(void* context, uintptr_t* pc, uintptr_t* sp)
@@ -422,7 +424,9 @@ static void crash_handler(int sig, siginfo_t* si, void* uc)
 	if (pc)
 		port_crash_dump_memory(pc, sp);
 	port_crash_describe_context();
+#ifndef __ANDROID__
 	crash_symbolise(bt, n);
+#endif
 	port_stub_report();
 #ifdef __APPLE__
 	// Under Rosetta, a translated process that dies from a re-raised fatal

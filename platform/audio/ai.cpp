@@ -223,6 +223,8 @@ bool open_sdl()
 {
 #ifdef _WIN32
 	void* h = dlopen("SDL2.dll", RTLD_NOW | RTLD_GLOBAL);
+#elif defined(__ANDROID__)
+	void* h = dlopen("libSDL2.so", RTLD_NOW | RTLD_GLOBAL);
 #elif defined(__APPLE__)
 	// Prefer symbols already linked (SDL2.framework), then common dylib names.
 	void* h = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);

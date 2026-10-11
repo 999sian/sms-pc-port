@@ -13,7 +13,7 @@
 #include <dolphin/os/OSError.h>
 #include <dolphin/os/OSMemory.h>
 #include <time.h>
-#include <execinfo.h>
+#include "port_backtrace.h"
 
 extern "C" void port_os_threads_init(void);
 
