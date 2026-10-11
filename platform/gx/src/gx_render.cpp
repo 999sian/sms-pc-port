@@ -1813,6 +1813,7 @@ static uint32_t s_mqSlotFrame = ~0u;
 static bool s_pixActive = false, s_pixTaint = false;
 static uint32_t s_pixTris = 0;
 static uint64_t s_pixSamples = 0;  // counted before the pending queries
+static uint32_t s_pixLastRead = 0;
 static GLuint s_pixCur = 0;
 static bool s_pixCurPooled = false;
 static std::vector<GLuint> s_queryPool;
@@ -1865,6 +1866,7 @@ void pixMetricClear() {
     }
     s_pixSamples = 0;
     s_pixTris = 0;
+    s_pixLastRead = 0;
     s_pixTaint = !asyncReads() || s_mqSlot >= kMetricSlots;
     glBeginQuery(GL_SAMPLES_PASSED, s_pixCur);
     s_pixActive = true;
@@ -1872,7 +1874,8 @@ void pixMetricClear() {
 
 uint32_t pixMetricRead() {
     flushBatch();
-    if (!s_ready || !s_pixActive) return 0;
+    if (!s_ready) return 0;
+    if (!s_pixActive) return s_pixLastRead;
     glEndQuery(GL_SAMPLES_PASSED);
     uint64_t samples = 0;
     int cur = s_frameNo & 1, slot = s_mqSlot;
@@ -1902,7 +1905,21 @@ uint32_t pixMetricRead() {
     s_pixCurPooled = true;
     glBeginQuery(GL_SAMPLES_PASSED, s_pixCur);
     uint64_t v = uint64_t(double(samples) / (double(s_scale) * double(s_scale))) + uint64_t(s_pixTris) * 4;
-    return v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v);
+    s_pixLastRead = v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v);
+    return s_pixLastRead;
+}
+
+void pixMetricEnd() {
+    flushBatch();
+    if (!s_ready || !s_pixActive) return;
+    // GXReadPixMetric has already returned the scope's result and started
+    // an empty continuation query. The game's pollution callback explicitly
+    // ends that scope: ordinary scene drawing need not keep counting unused
+    // samples. Keep the completed result and the pooled frame query intact.
+    glEndQuery(GL_SAMPLES_PASSED);
+    if (s_pixCurPooled) s_queryPool.push_back(s_pixCur);
+    pixReleasePending();
+    s_pixActive = false;
 }
 
 static void prefetchMetrics() {
@@ -2236,6 +2253,16 @@ void flushBatch() {
         glColorMask(masks[0], masks[1], masks[2], masks[3]);
         glcUseProgram(sp->prog);
     } else {
+#ifdef __ANDROID__
+        // GLES 3.1 lacks base-vertex draws. Use the retained CPU indices for
+        // ordinary draws too, avoiding a synchronous GPU index readback.
+        for (const Range& r : ranges) {
+            glcBindVertexArray(r.vao);
+            android::IndexRange indicesRange(r.iOff, r.count, r.base, s_stream.buf, r.indices);
+            glDrawElementsBaseVertex(mode, r.count, GL_UNSIGNED_INT,
+                                     reinterpret_cast<const void*>(indicesRange.offset), indicesRange.base);
+        }
+#else
         // consecutive ranges on one VAO go in one multi-draw
         static std::vector<GLsizei> counts;
         static std::vector<const void*> offsets;
@@ -2261,6 +2288,7 @@ void flushBatch() {
             }
             i = j;
         }
+#endif
     }
     s_stats.draws++;
     s_flushes++;
