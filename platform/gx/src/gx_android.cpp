@@ -6,6 +6,7 @@
 #include "gx_internal.h"
 #include "gx_android.h"
 #include <cstring>
+#include <array>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +18,9 @@ PFNGLENABLEPROC enable;
 PFNGLDISABLEPROC disable;
 PFNGLGETINTEGERVPROC getInteger;
 PFNGLUSEPROGRAMPROC useProgram;
+PFNGLDELETEPROGRAMPROC deleteProgram;
+PFNGLLINKPROGRAMPROC linkProgram;
+PFNGLPROGRAMBINARYPROC programBinary;
 PFNGLDRAWELEMENTSBASEVERTEXPROC drawBase;
 PFNGLBEGINQUERYPROC beginQuery;
 PFNGLENDQUERYPROC endQuery;
@@ -33,6 +37,14 @@ int textureW, textureH;
 std::unordered_map<GLuint, GLuint> counters;
 std::unordered_map<GLuint, float> samplerBias;
 GLuint unitSampler[8] = {};
+struct UniformState {
+    GLint logicOp, logicDest, point, lod;
+    GLint lastLogic = -100;
+    GLfloat lastPoint = 0;
+    std::array<GLfloat, 8> lastLod{};
+    bool destWritten = false, pointWritten = false, lodWritten = false;
+};
+std::unordered_map<GLuint, UniformState> uniformStates;
 
 bool has(const char* name) {
     GLint n = 0;
@@ -50,18 +62,42 @@ bool unsupported(GLenum cap) {
 }
 void uniforms() {
     if (!program) return;
-    GLint loc = glGetUniformLocation(program, "u_smsLogicOp");
-    if (loc >= 0) glUniform1i(loc, logicEnabled ? GLint(logic - GL_CLEAR) : -1);
-    loc = glGetUniformLocation(program, "u_smsLogicDest");
-    if (loc >= 0) glUniform1i(loc, 8);
-    loc = glGetUniformLocation(program, "u_smsPointSize");
-    if (loc >= 0) glUniform1f(loc, pointSize);
-    loc = glGetUniformLocation(program, "u_smsLodBias");
-    if (loc >= 0) {
-        GLfloat values[8];
-        for (int i = 0; i < 8; ++i) values[i] = samplerBias[unitSampler[i]];
-        glUniform1fv(loc, 8, values);
+    // Metric draws can switch programs for every triangle. Uniform lookup is
+    // a synchronous driver round trip on some Android drivers and emulators;
+    // cache locations and the values retained by each linked program.
+    auto entry = uniformStates.try_emplace(program);
+    UniformState& u = entry.first->second;
+    if (entry.second) {
+        u.logicOp = glGetUniformLocation(program, "u_smsLogicOp");
+        u.logicDest = glGetUniformLocation(program, "u_smsLogicDest");
+        u.point = glGetUniformLocation(program, "u_smsPointSize");
+        u.lod = glGetUniformLocation(program, "u_smsLodBias");
     }
+    const GLint operation = logicEnabled ? GLint(logic - GL_CLEAR) : -1;
+    if (u.logicOp >= 0 && operation != u.lastLogic) {
+        glUniform1i(u.logicOp, operation); u.lastLogic = operation;
+    }
+    if (u.logicDest >= 0 && !u.destWritten) {
+        glUniform1i(u.logicDest, 8); u.destWritten = true;
+    }
+    if (u.point >= 0 && (!u.pointWritten || pointSize != u.lastPoint)) {
+        glUniform1f(u.point, pointSize); u.lastPoint = pointSize; u.pointWritten = true;
+    }
+    if (u.lod >= 0) {
+        std::array<GLfloat, 8> values{};
+        for (int i = 0; i < 8; ++i) {
+            auto bias = samplerBias.find(unitSampler[i]);
+            if (bias != samplerBias.end()) values[i] = bias->second;
+        }
+        if (!u.lodWritten || values != u.lastLod) {
+            glUniform1fv(u.lod, 8, values.data()); u.lastLod = values; u.lodWritten = true;
+        }
+    }
+}
+void deleteProgramAdapter(GLuint p) { uniformStates.erase(p); deleteProgram(p); }
+void linkProgramAdapter(GLuint p) { uniformStates.erase(p); linkProgram(p); }
+void programBinaryAdapter(GLuint p, GLenum format, const void* binary, GLsizei size) {
+    uniformStates.erase(p); programBinary(p, format, binary, size);
 }
 void samplerAdapter(GLuint sampler, GLenum name, GLfloat value) {
     if (name == GL_TEXTURE_LOD_BIAS) { samplerBias[sampler] = value; uniforms(); }
@@ -187,6 +223,24 @@ void replace(std::string& s, const std::string& from, const std::string& to) {
 }
 
 bool metricActive() { return metricOn; }
+bool needsRebasedIndices() { return drawBase == rebaseDraw; }
+IndexRange::IndexRange(size_t sourceOffset, int count, int sourceBase, unsigned buffer, const uint32_t* src)
+    : offset(sourceOffset), base(sourceBase) {
+    if (drawBase != rebaseDraw || !base || count <= 0) return;
+    if (!src) fatal("Android base-vertex range has no CPU indices");
+    std::vector<uint32_t> indices(size_t(count), 0);
+    for (int i = 0; i < count; ++i) indices[size_t(i)] = src[i] + base;
+    if (!rebasedIndices) glGenBuffers(1, &rebasedIndices);
+    originalBuffer = buffer;
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, rebasedIndices);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(indices.size() * 4), indices.data(), GL_STREAM_DRAW);
+    offset = 0;
+    base = 0;
+    rebased = true;
+}
+IndexRange::~IndexRange() {
+    if (rebased) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, originalBuffer);
+}
 bool desktopEntry(const char* name) {
     return !strcmp(name, "glLogicOp") || !strcmp(name, "glPointSize") ||
            !strcmp(name, "glClearDepth") || !strcmp(name, "glDepthRange") ||
@@ -198,6 +252,7 @@ void install(void* (*getProc)(const char*)) {
     proc = getProc;
     enable = glEnable; disable = glDisable; getInteger = glGetIntegerv;
     useProgram = glUseProgram; drawBase = glDrawElementsBaseVertex;
+    deleteProgram = glDeleteProgram; linkProgram = glLinkProgram; programBinary = glProgramBinary;
     samplerParameter = glSamplerParameterf; bindSampler = glBindSampler;
     GLint major = 0, minor = 0;
     getInteger(GL_MAJOR_VERSION, &major); getInteger(GL_MINOR_VERSION, &minor);
@@ -212,6 +267,8 @@ void install(void* (*getProc)(const char*)) {
     depthClamp = has("GL_EXT_depth_clamp");
     gx::gl::gx_glEnable = enableAdapter; gx::gl::gx_glDisable = disableAdapter;
     gx::gl::gx_glGetIntegerv = integerAdapter; gx::gl::gx_glUseProgram = programAdapter;
+    gx::gl::gx_glDeleteProgram = deleteProgramAdapter; gx::gl::gx_glLinkProgram = linkProgramAdapter;
+    if (programBinary) gx::gl::gx_glProgramBinary = programBinaryAdapter;
     gx::gl::gx_glSamplerParameterf = samplerAdapter; gx::gl::gx_glBindSampler = bindSamplerAdapter;
     gx::gl::gx_glLogicOp = logicAdapter; gx::gl::gx_glPointSize = pointAdapter;
     gx::gl::gx_glClearDepth = clearDepthAdapter; gx::gl::gx_glDepthRange = depthRangeAdapter;

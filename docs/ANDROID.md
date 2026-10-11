@@ -27,7 +27,11 @@ Android's normal address space for SDL, libc, the graphics driver or Java.
 This is an internal layout compatibility constraint, not a 32-bit APK.
 
 GLES 3.1 or newer is required. Base-vertex drawing uses GLES 3.2 or its
-extension when available, with an index-rebasing fallback for GLES 3.1. Shader generation
+extension when available, with an index-rebasing fallback for GLES 3.1.
+Ordered metric passes rebase each range once from retained CPU indices;
+stream uploads avoid synchronous GPU readbacks and map/unmap round trips.
+Android shader adapters cache uniform locations and retained values, with
+invalidation on program deletion, linking and binary loading. Shader generation
 uses GLSL ES, with explicit fragment locations and precision. Desktop-only
 depth-range/clear-depth, point-size and multi-draw calls have GLES adapters.
 Color logic operations use a destination snapshot per primitive. Numeric

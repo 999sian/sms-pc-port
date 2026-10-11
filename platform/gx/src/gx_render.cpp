@@ -181,6 +181,13 @@ struct StreamBuffer {
             return;
         }
         glcBindArrayBuffer(buf);
+#ifdef __ANDROID__
+        // Android emulators synchronously acknowledge map/unmap calls. The
+        // stream's fences already protect these bytes, so submit the known
+        // CPU data without mapping a live GPU buffer.
+        glBufferSubData(GL_ARRAY_BUFFER, GLintptr(at), GLsizeiptr(n), data);
+        return;
+#endif
         glt::postData(data, n, [at, n](const uint8_t* d) {
             void* dst = glMapBufferRange(GL_ARRAY_BUFFER, GLintptr(at), GLsizeiptr(n),
                                          GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
@@ -239,6 +246,11 @@ struct StreamBuffer {
             return;
         }
         glcBindArrayBuffer(buf);
+#ifdef __ANDROID__
+        for (int i = 0; i < n; ++i)
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(pc[i].at), GLsizeiptr(pc[i].bytes), pc[i].data);
+        return;
+#endif
         if (glt::active()) {  // the GL thread maps and writes a copy of the pieces
             static std::vector<uint8_t> block;
             block.resize(end - first);
@@ -1302,6 +1314,11 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 // SMS_GX_DL_ARENA=0 copies them into each batch instead.
 static size_t s_arenaPos = 0;  // from the arena's start
 static uint32_t s_arenaGen = 1;
+#ifdef __ANDROID__
+// GLES 3.1 rebasing reads CPU indices, never a live GPU stream. Retain only
+// arena indices (not vertex data); streamed indices already live in s_bidx.
+static std::unordered_map<size_t, std::vector<uint32_t>> s_arenaIndices;
+#endif
 
 bool arenaEnabled() {
     static int on = -1;
@@ -1323,12 +1340,18 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
         glDeleteSync(done);
         s_arenaPos = 0;
         s_arenaGen++;
+#ifdef __ANDROID__
+        s_arenaIndices.clear();
+#endif
     }
     const size_t base = s_stream.size;
     const size_t vOff = (base + s_arenaPos + stride - 1) / stride * stride;
     const size_t iOff = (vOff + vbytes + 3) & ~size_t(3);
     s_stream.writeAt(vOff, verts, vbytes);
     s_stream.writeAt(iOff, idx, ibytes);
+#ifdef __ANDROID__
+    if (android::needsRebasedIndices()) s_arenaIndices[iOff].assign(idx, idx + nidx);
+#endif
     s_arenaPos = iOff + ibytes - base;
     out.gen = s_arenaGen;
     out.baseVertex = int32_t(vOff / stride);
@@ -2101,6 +2124,9 @@ void flushBatch() {
         size_t iOff;
         GLsizei count;
         GLint base;
+#ifdef __ANDROID__
+        const uint32_t* indices = nullptr;
+#endif
     };
     static std::vector<Range> ranges;
     ranges.clear();
@@ -2113,6 +2139,17 @@ void flushBatch() {
         }
     }
     #ifdef __ANDROID__
+    if (android::needsRebasedIndices()) {
+        for (Range& r : ranges) {
+            if (r.iOff < s_stream.size) r.indices = s_bidx.data + (r.iOff - iOff) / 4;
+            else {
+                auto stored = s_arenaIndices.find(r.iOff);
+                if (stored == s_arenaIndices.end() || stored->second.size() < size_t(r.count))
+                    fatal("Android arena index range is unavailable");
+                r.indices = stored->second.data();
+            }
+        }
+    }
     if (s_pixActive && android::metricActive()) {
         const ShaderProgram* metricSp = shaderForCurrentState(false, true);
         glcUseProgram(metricSp->prog);
@@ -2135,29 +2172,30 @@ void flushBatch() {
         // The ordinary shader then preserves GX's late/early Z semantics.
         for (const Range& r : ranges) {
             glcBindVertexArray(r.vao);
+            android::IndexRange indicesRange(r.iOff, r.count, r.base, s_stream.buf, r.indices);
             if (!ordered) {
                 // Opaque, early-Z and read-only-depth draws can count in the
                 // colour shader itself, preserving the renderer's batching.
                 glcUseProgram(metricSp->prog);
                 glDrawElementsBaseVertex(mode, r.count, GL_UNSIGNED_INT,
-                                         reinterpret_cast<const void*>(r.iOff), r.base);
+                                         reinterpret_cast<const void*>(indicesRange.offset), indicesRange.base);
                 continue;
             }
             for (size_t i = 0; i < size_t(r.count); i += step) {
-                const void* indices = reinterpret_cast<const void*>(r.iOff + i * 4);
+                const void* indices = reinterpret_cast<const void*>(indicesRange.offset + i * 4);
                 glcUseProgram(metricSp->prog);
                 glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
                 glDepthMask(GL_FALSE);
-                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
                 glcUseProgram(sp->prog);
                 glColorMask(masks[0], masks[1], masks[2], masks[3]);
                 glDepthMask(earlyFallback ? GL_FALSE : depthMask);
-                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
                 if (earlyFallback) {
                     glcUseProgram(depthSp->prog);
                     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
                     glDepthMask(GL_TRUE);
-                    glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
+                    glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, indicesRange.base);
                 }
             }
         }
