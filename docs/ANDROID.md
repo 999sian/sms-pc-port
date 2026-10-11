@@ -54,7 +54,16 @@ NDK's `llvm-addr2line`.
 The launcher isolates each game session in its own process. Closing its SDL
 window releases the renderer, flushes the game log, and ends that process
 without running global destructors alongside still-running SDK workers.
-The next Play starts with fresh heaps, threads, and caches.
+The next Play starts with fresh heaps, threads, and caches. Android frame waits
+also yield a retrace when lower-priority resource loading is runnable, so
+a slow presentation cannot starve the stage loader after movies.
+
+For renderer diagnostics, `SMS_GX_FINISH_BEFORE_SWAP=1` forces `glFinish`
+before presentation and logs render-completion wait and buffer-swap time
+separately every 30 frames. It is off by default. This serializes rendering
+and is not an asynchronous GPU timestamp or a normal performance benchmark.
+The overlay's ordinary swap time includes work the driver finishes inside
+`SDL_GL_SwapWindow`; its explicit GPU-wait field excludes that wait.
 
 Validation must include installing the actual ARM64 APK, title/file selection,
 an imported save, stage gameplay and unskipped movies. ARM64 translation in
