@@ -875,7 +875,16 @@ void sms_gx_pump_events(void) {
             (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE)) {
             logmsg("window closed, exiting");
             GXPC_Shutdown();
+#ifdef __ANDROID__
+            // The launcher runs each game session in its own process. SDK
+            // worker threads still reference global mutexes; exit() would
+            // destroy those globals while the workers are running.
+            fflush(stdout);
+            fflush(stderr);
+            _Exit(0);
+#else
             exit(0);
+#endif
         }
     }
 #endif

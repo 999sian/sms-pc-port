@@ -51,6 +51,11 @@ log, rather than desktop `execinfo` or an external `addr2line` process.
 Resolve offsets offline using the matching unstripped `libsms.so` and the
 NDK's `llvm-addr2line`.
 
+The launcher isolates each game session in its own process. Closing its SDL
+window releases the renderer, flushes the game log, and ends that process
+without running global destructors alongside still-running SDK workers.
+The next Play starts with fresh heaps, threads, and caches.
+
 Validation must include installing the actual ARM64 APK, title/file selection,
 an imported save, stage gameplay and unskipped movies. ARM64 translation in
 an Android emulator is suitable for correctness checks, but physical handheld
