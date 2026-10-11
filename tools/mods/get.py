@@ -5,6 +5,8 @@
     python3 tools/mods/get.py extras      only the extras: HD textures the UHD pack lacks
                                           (--if-outdated: only if not the pinned release)
     python3 tools/mods/get.py eclipse     Super Mario Eclipse (patched from your disc)
+    python3 tools/mods/get.py language fr the game's text in French (de, es, it: German,
+                                          Spanish, Italian); --if-outdated as for extras
     python3 tools/mods/get.py all         textures and Eclipse
 
 Each mod's previous install is removed first, then its release is downloaded
@@ -60,6 +62,11 @@ TEXTURES = {
 with open(os.path.join(HERE, "texture-extras.json"), encoding="utf-8") as f:
     EXTRAS = dict(json.load(f), install=os.path.join(MODS, "textures", "sms-hd-texture-extras"))
 EXTRAS_RECORD = ".release"
+# The European release's text and menus for each of its languages, which
+# `language = <code>` in settings.txt plays the game in (platform/misc/
+# language.cpp); pinned in language-packs.json, which SMS Launcher also reads.
+with open(os.path.join(HERE, "language-packs.json"), encoding="utf-8") as f:
+    LANGUAGE_PACKS = json.load(f)
 ECLIPSE = {
     "name": "Super Mario Eclipse v1.1.0 (Eclipse Team)",
     "page": "https://gamebanana.com/mods/536309",
@@ -298,6 +305,59 @@ def get_extras(keep, if_outdated=False):
     say("Installed %d textures in %s." % (count, os.path.relpath(mod["install"], ROOT)))
 
 
+def language_install(code):
+    return os.path.join(MODS, "languages", code)
+
+
+def language_current(code):
+    """Whether the installed pack for `code` is the pinned release."""
+    try:
+        with open(os.path.join(language_install(code), EXTRAS_RECORD), encoding="utf-8") as f:
+            return json.load(f).get("md5") == LANGUAGE_PACKS["languages"][code]["md5"]
+    except (OSError, ValueError, AttributeError, KeyError):
+        return False
+
+
+def get_language(code, keep, if_outdated=False):
+    langs = LANGUAGE_PACKS["languages"]
+    if code not in langs:
+        raise Failure("no language pack %s (there are %s)" % (code, ", ".join(sorted(langs))))
+    mod = dict(langs[code], page=LANGUAGE_PACKS["page"],
+               name="%s (%s)" % (LANGUAGE_PACKS["name"], langs[code]["name"]))
+    install = language_install(code)
+    if if_outdated and language_current(code):
+        say("The %s language pack is up to date (%s)." % (langs[code]["name"], LANGUAGE_PACKS["name"]))
+        return
+    say("== Language pack: %s" % mod["name"])
+    if os.path.isdir(install):
+        say("Removing the previous install, %s" % os.path.relpath(install, ROOT))
+        remove(install)
+    need_space(MODS, 3 * mod["size"] + (16 << 20))
+    archive = fetch(mod)
+    tmp = install + ".part"
+    remove(tmp)
+    try:
+        # the zip holds <code>/files/..., as the port reads mods/languages/<code>/files/
+        with zipfile.ZipFile(archive) as z:
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            if not names or any(not n.startswith(code + "/files/") or ".." in n.split("/") for n in names):
+                raise Failure("the archive is not laid out as expected (%s/files/...)" % code)
+            z.extractall(tmp)
+        os.makedirs(os.path.dirname(install), exist_ok=True)
+        os.replace(os.path.join(tmp, code), install)
+        with open(os.path.join(install, EXTRAS_RECORD), "w", encoding="utf-8") as f:
+            json.dump({"name": mod["name"], "file": mod["file"], "md5": mod["md5"]}, f, indent=2)
+    except (OSError, zipfile.BadZipFile) as e:
+        remove(install)
+        raise Failure("could not unpack %s: %s" % (os.path.basename(archive), e))
+    finally:
+        remove(tmp)
+        if not keep:
+            remove(archive)
+    say("Installed %s in %s; `language = %s` in settings.txt plays the game in it."
+        % (langs[code]["name"], os.path.relpath(install, ROOT), code))
+
+
 def get_eclipse(keep, iso_arg):
     mod = ECLIPSE
     say("== Eclipse: %s" % mod["name"])
@@ -360,7 +420,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="\n\n".join(__doc__.split("\n\n")[1:]))
-    ap.add_argument("what", choices=["textures", "extras", "eclipse", "all"])
+    ap.add_argument("what", choices=["textures", "extras", "eclipse", "language", "all"])
+    ap.add_argument("language", nargs="?", help="with language: fr, de, es or it")
     ap.add_argument("--iso")
     ap.add_argument("--keep-download", action="store_true")
     ap.add_argument("--if-outdated", action="store_true")
@@ -370,6 +431,10 @@ def main():
             get_textures(args.keep_download)
         if args.what == "extras":
             get_extras(args.keep_download, args.if_outdated)
+        if args.what == "language":
+            if not args.language:
+                raise Failure("which language? fr, de, es or it")
+            get_language(args.language, args.keep_download, args.if_outdated)
         if args.what in ("eclipse", "all"):
             get_eclipse(args.keep_download, args.iso)
     except Failure as e:
