@@ -548,6 +548,16 @@ extern "C" void OSInitThreadQueue(OSThreadQueue* queue) { queue->head = queue->t
 
 extern "C" OSThread* OSGetCurrentThread(void) { return g_cur; }
 
+extern "C" int port_os_background_ready(void)
+{
+	if (!g_cur || g_sched_disabled || g_in_irq)
+		return 0;
+	for (OSThread* t : g_threads)
+		if (t != g_cur && runnable(t) && t->priority > g_cur->priority)
+			return 1;
+	return 0;
+}
+
 extern "C" BOOL OSIsThreadTerminated(OSThread* t)
 {
 	return t->state == OS_THREAD_STATE_MORIBUND || t->state == 0;

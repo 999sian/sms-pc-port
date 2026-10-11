@@ -310,8 +310,21 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 	const double entry = seconds_now();
 	if (ready > 0)
 		work += (entry - ready - (GXPC_LastPresentSeconds ? GXPC_LastPresentSeconds() : 0) - work) * 0.1;
-	while ((s32)(VIGetRetraceCount() - due) < 0)
+	bool waited = false;
+	while ((s32)(VIGetRetraceCount() - due) < 0) {
 		VIWaitForRetrace();
+		waited = true;
+	}
+#ifdef __ANDROID__
+	// Android presentation can consume the whole retrace interval. Skipping
+	// the SDK wait then keeps the main thread runnable forever, starving the
+	// lower-priority stage loader. Sleep for one retrace only when background
+	// work needs the emulated CPU and this frame has not already yielded it.
+	if (!waited && port_os_background_ready())
+		VIWaitForRetrace();
+#else
+	(void)waited;
+#endif
 	const s32 now = (s32)VIGetRetraceCount();
 	if (now - due > max_behind)
 		due = now;

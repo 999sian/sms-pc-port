@@ -732,9 +732,38 @@ void GXPC_Present(const void* xfb) {
             GXPC_OverlayDraw(w, h);
             cheatMenuRender(w, h);
             t1 = nowSeconds();
+#ifdef __ANDROID__
+            // Diagnostic only: separate unfinished GPU work from buffer
+            // presentation. Keep the total swap timer unchanged so it can
+            // still be compared with ordinary runs. This forces completion
+            // and therefore is not an asynchronous GPU-time measurement.
+            using FinishFn = void (*)();
+            static FinishFn finish = envTrue("SMS_GX_FINISH_BEFORE_SWAP")
+                ? reinterpret_cast<FinishFn>(SDL_GL_GetProcAddress("glFinish")) : nullptr;
+            double finished = t1;
+            if (finish) {
+                finish();
+                finished = nowSeconds();
+            }
+#endif
             if (hdr) hdrFramePresent(s_vsync != 0);
             else SDL_GL_SwapWindow(s_window);
             tSwapped = nowSeconds();
+#ifdef __ANDROID__
+            if (finish) {
+                static unsigned frames = 0;
+                static double completion = 0, swap = 0;
+                completion += finished - t1;
+                swap += tSwapped - finished;
+                if (++frames == 30) {
+                    logmsg("swap diagnostic: %u frames, %.1f ms/frame waiting for render completion, "
+                           "%.1f ms/frame in buffer swap", frames,
+                           completion * 1000 / frames, swap * 1000 / frames);
+                    frames = 0;
+                    completion = swap = 0;
+                }
+            }
+#endif
         });
         {  // the wait for the frame's queued work counts as GX's, the rest is presenting
             const double waited = glt::waitedSeconds() - waited0;
