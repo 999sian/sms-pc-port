@@ -18,6 +18,13 @@
 
 namespace {
 
+bool timingLogEnabled() {
+    static const bool on = [] {
+        const char* e = getenv("SMS_TIMING_LOG");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    return on;
+}
 bool s_visible = false;
 bool s_panelDirty = true;
 const int kSpeeds[] = {1, 2, 4, 10};
@@ -33,7 +40,7 @@ struct FrameClock {
     double start = 0, windowStart = 0, last = 0;
     GXPCTimes atWindow = {};
     int frames = 0, shownFrames = 0;
-    double worst = 0;
+    double worst = 0, lastLog = 0;
     // shown values, ms per frame
     double fps = 0, shownFps = 0, avgMs = 0, maxMs = 0;
     GXPCTimes per = {};
@@ -73,6 +80,12 @@ struct FrameClock {
             maxMs = worst * 1000.0;
             gameMs = avgMs - per.gx - per.present - per.swap - per.idle;
             if (gameMs < 0) gameMs = 0;
+            if (timingLogEnabled() && t - lastLog >= 2.0) {
+                gx::logmsg("timing: game %.2f FPS, shown %.2f FPS, frame %.2f ms avg/%.2f ms worst; "
+                           "game %.2f, GX %.2f, present %.2f, swap %.2f, idle %.2f, explicit GPU waits %.2f ms/frame",
+                           fps, shownFps, avgMs, maxMs, gameMs, per.gx, per.present, per.swap, per.idle, per.gpuWait);
+                lastLog = t;
+            }
             atWindow = now;
             windowStart = t;
             frames = 0;
@@ -128,14 +141,17 @@ extern "C" {
 void GXPC_OverlayToggle(void) {
     s_visible = !s_visible;
     s_panelDirty = true;
-    GXPC_SetDetailedTimers(s_visible);
+    GXPC_SetDetailedTimers(s_visible || timingLogEnabled());
 }
 int GXPC_OverlayVisible(void) { return s_visible; }
 
 void GXPC_CycleSpeed(void) { s_speedIndex.store((s_speedIndex.load() + 1) % int(sizeof kSpeeds / sizeof kSpeeds[0])); }
 int GXPC_GetSpeed(void) { return kSpeeds[s_speedIndex.load()]; }
 
-void GXPC_OverlayFrame(void) { s_clock.tick(); }
+void GXPC_OverlayFrame(void) {
+    if (timingLogEnabled()) GXPC_SetDetailedTimers(1);
+    s_clock.tick();
+}
 
 void GXPC_OverlayDraw(int winW, int winH) {
     static bool s_envChecked = false;

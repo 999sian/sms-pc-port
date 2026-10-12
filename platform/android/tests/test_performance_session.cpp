@@ -3,7 +3,7 @@
 #include <cstdio>
 
 namespace {
-int creates, closes, updates, reports, queries, failReport, failTarget;
+int creates, closes, updates, reports, queries, failReport, failTarget, efficiencyRequests, failEfficiency;
 bool supported = true, accepts = true;
 int32_t lastTids[2]; size_t lastCount;
 int64_t lastTarget, lastWork;
@@ -19,15 +19,20 @@ APerformanceHintSession* create(APerformanceHintManager*, const int32_t* tids, s
 int target(APerformanceHintSession*, int64_t ns) { ++updates; lastTarget = ns; return failTarget; }
 int report(APerformanceHintSession*, int64_t ns) { ++reports; lastWork = ns; return failReport; }
 void close(APerformanceHintSession*) { ++closes; }
+int powerEfficiency(APerformanceHintSession*, bool enabled) { assert(!enabled); ++efficiencyRequests; return failEfficiency; }
 port_android::HintApi api{manager, create, target, report, close};
 }
 int main() {
+    assert(port_android::workTarget(16683333, true) == 13346667);
+    assert(port_android::workTarget(33366666, true) == 26693333);
+    assert(port_android::workTarget(16683333, false) == 16683333);
     {
         port_android::HintSession hints(api);
         assert(!hints.configure(0, 22, 16666667));
         assert(!hints.configure(11, 22, 0));
         assert(creates == 0);
         assert(hints.configure(11, 22, 16666667));
+        assert(hints.powerEfficiencyStatus() == -1);
         assert(lastCount == 2 && lastTids[0] == 11 && lastTids[1] == 22);
         assert(lastTarget == 16666667);
         assert(hints.configure(11, 22, 16666667));
@@ -48,6 +53,21 @@ int main() {
         assert(!hints.configure(33, 33, 16666667));
         assert(!hints.report(18000000));
         assert(creates + reports + updates == calls);
+    }
+    failReport = 0;
+    {
+        auto modern = api; modern.powerEfficiency = powerEfficiency;
+        port_android::HintSession hints(modern);
+        assert(hints.configure(11, 22, 13346667));
+        assert(efficiencyRequests == 1 && hints.powerEfficiencyStatus() == 0);
+        assert(hints.configure(11, 22, 13346667) && efficiencyRequests == 1);
+        hints.close();
+        assert(hints.configure(11, 22, 13346667) && efficiencyRequests == 2);
+        failEfficiency = 95;
+        hints.close();
+        assert(hints.configure(11, 22, 13346667));
+        assert(hints.powerEfficiencyStatus() == 95);
+        assert(hints.report(18000000)); // optional rejection preserves basic hints
     }
     supported = false;
     {
@@ -74,5 +94,5 @@ int main() {
         assert(closes == before + 1);
         assert(!hints.configure(11, 22, 16666667));
     }
-    puts("Performance hint thread groups, budgets, pause/resume and service failures passed");
+    puts("Performance hint headroom, thread groups, budgets, pause/resume and optional/service failures passed");
 }

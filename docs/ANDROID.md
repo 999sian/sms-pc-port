@@ -73,7 +73,7 @@ an imported save, stage gameplay and unskipped movies. ARM64 translation in
 an Android emulator is suitable for correctness checks, but physical handheld
 testing is still needed for performance, thermal behavior and controller feel.
 
-Android 12+ performance hints register the SDK thread producing frames and
+Android 13+ native performance hints register the SDK thread producing frames and
 its GL worker when enabled (Android normally keeps both on one thread) with APerformanceHintManager. Each SDK frame wait reports the
 work cycle since the last wait ended, then starts the next cycle after the
 intentional pacing sleep. The budget follows the actual retrace count per
@@ -92,3 +92,33 @@ The Android launcher declares the application category as game. Its
 comparison (`SMS_ANDROID_PERFORMANCE_HINTS=0`). The **Show performance overlay**
 switch reports our own frame rate/timings rather than only SurfaceFlinger FPS.
 A device's game policies and clocks remain under Android/OEM control.
+
+The default-on **Request performance headroom** setting requests 80% of the
+actual frame interval as the ADPF work deadline (13.35 ms at nominal 60 FPS),
+reserving 20% for presentation/scheduling variation. Measurements remain
+unaltered and game cadence is unchanged. `SMS_ANDROID_PERFORMANCE_HEADROOM=0`
+restores the v8 full-frame deadline. This candidate is intended to test whether
+an earlier deadline improves the tester's low-clock behavior; it has not been
+validated on Samsung hardware. Android 15's optional power-efficiency setting
+is explicitly set false on each new session; false is already the OS default,
+so this is not itself evidence of a boost. Errors in that optional request do
+not discard a working basic hint session.
+
+The launcher sends a Surface frame-rate request for the selected 30/60 FPS on
+Android 11+, with a switch for comparisons. It reads Game Mode on each resume
+and reports interruptible gameplay/no gameplay via Android 13+ Game State on
+resume/pause. It does not claim uninterruptible play or continuous loading.
+No game-mode configuration disables OEM interventions; the user selects
+Performance mode in the device's game dashboard. Startup policy and display
+information are snapshots, not proof of a policy's continued enforcement.
+
+`SMS_TIMING_LOG=1` enables low-rate, hidden-overlay diagnostics: the overlay's
+one-second game/shown FPS and frame-time windows are logged roughly every
+two seconds. Native workload and SDK-pacing averages/maxima log every 120
+frames. Native workload includes wall time and main-thread CPU time, plus a
+point-in-time CPU core/frequency read when permitted (-1 unavailable).
+Detailed renderer CPU timers remain enabled even when the overlay is hidden;
+no overlay bitmap is drawn or uploaded for logging alone. Logging has some
+overhead. These are not asynchronous GPU timestamps. Use a stationary scene
+and export the log after 30 seconds without recording, notifications or screen
+touches; export before another Play replaces it.

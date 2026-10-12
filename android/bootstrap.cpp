@@ -36,6 +36,8 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** 
     if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    if (const char* policy = getenv("SMS_ANDROID_STARTUP_POLICY"))
+        fprintf(stderr, "[android] startup policy: %s\n", policy);
     setenv("HOME", data.c_str(), 1);
     setenv("XDG_CACHE_HOME", (data + "/cache").c_str(), 1);
     setenv("SMS_GX_GL_THREAD", "0", 0); // Android SDL owns the surface's thread.

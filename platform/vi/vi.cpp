@@ -318,6 +318,13 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 	const double entry = seconds_now();
 	if (ready > 0)
 		work += (entry - ready - (GXPC_LastPresentSeconds ? GXPC_LastPresentSeconds() : 0) - work) * 0.1;
+#ifdef __ANDROID__
+    static const bool logTiming = [] {
+        const char* e = getenv("SMS_TIMING_LOG");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    bool backgroundYield = false;
+#endif
 	bool waited = false;
 	while ((s32)(VIGetRetraceCount() - due) < 0) {
 		VIWaitForRetrace();
@@ -328,8 +335,10 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 	// the SDK wait then keeps the main thread runnable forever, starving the
 	// lower-priority stage loader. Sleep for one retrace only when background
 	// work needs the emulated CPU and this frame has not already yielded it.
-	if (!waited && port_os_background_ready())
+	if (!waited && port_os_background_ready()) {
+        backgroundYield = true;
 		VIWaitForRetrace();
+    }
 #else
 	(void)waited;
 #endif
@@ -338,6 +347,21 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 		due = now;
 	const int speed = GXPC_GetSpeed ? GXPC_GetSpeed() : 1;
 	const double period = frames * g_period_ns * 1e-9 / (speed > 0 ? speed : 1);
+#ifdef __ANDROID__
+    if (logTiming) {
+        static unsigned samples = 0, yields = 0;
+        static double totalWait = 0, maxWait = 0, budget = 0;
+        if (budget != period) { samples = yields = 0; totalWait = maxWait = 0; budget = period; }
+        const double wait = seconds_now() - entry;
+        totalWait += wait; maxWait = std::max(maxWait, wait);
+        yields += backgroundYield;
+        if (++samples == 120) {
+            fprintf(stderr, "[android] SDK pacing: %u frames, budget %.2f ms, wait avg %.2f/max %.2f ms, background yields %u\n",
+                    samples, period * 1000, totalWait / samples * 1000, maxWait * 1000, yields);
+            samples = yields = 0; totalWait = maxWait = 0;
+        }
+    }
+#endif
 	const bool skip = now - due >= frames && now - shown < max_unshown && work < period;
 	if (!skip)
 		shown = now;
