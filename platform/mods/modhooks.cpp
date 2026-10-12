@@ -226,6 +226,9 @@ extern "C" void sms_mod_activate(void)
 
 extern "C" uint32_t __OSBusClock;
 extern "C" uint32_t __OSCoreClock;
+#ifdef __ANDROID__
+extern "C" uint8_t* port_mem1_base;
+#endif
 extern "C" unsigned long OSGetConsoleType(void);
 extern "C" void* DVDGetCurrentDiskID(void);
 
@@ -237,6 +240,9 @@ namespace {
 void fill_boot_info()
 {
 	uint8_t* low = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x80000000u));
+#ifdef __ANDROID__
+	low = port_mem1_base;
+#endif
 	memcpy(low, DVDGetCurrentDiskID(), 0x20);
 	const uint32_t words[][2] = {
 		{0x28, 0x01800000u},               // physical memory size

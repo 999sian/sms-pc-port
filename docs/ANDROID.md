@@ -193,3 +193,30 @@ algorithm; gx_widescreen_test validates real rendered placement at 1x/2x.
 Its CPU routine benchmark measures only bounds scanning, not device FPS.
 Physical-device performance still requires comparison; do not run the
 Android container/emulator for this follow-up.
+
+An Adreno 740 device running v13 reported a display-list vertex-read crash
+after MEM1's preferred 0x80000000 mapping failed. The old fallback placed
+the arena at 0x7126bc8000, while arena rounding and legacy raw pointer fields
+truncated its addresses. SDK cached/physical conversions and GX's default
+MEM1 window also still assumed the preferred address. This is an address
+layout bug in the port's 64-bit compatibility layer.
+
+v15 retains the preferred arena when available, otherwise searches for a
+complete pointer-compatible mapping without replacing occupied pages. The
+low allocator checks fragmented address gaps at 1 MiB intervals; MEM1 may
+also use the upper half of the 32-bit compatibility window. Both arena
+endpoints must fit raw u32 fields (an ArenaHi exactly at 4 GiB is rejected).
+No arbitrary high heap fallback is accepted. Android SDK physical addresses
+are relative to the actual arena; CPU cached/uncached aliases share it. The
+renderer receives that base/size before the game emits commands, and native
+boot-info writes use the actual arena. Existing mappings are preserved.
+The application and game remain ARM64; legacy address fields are not a
+32-bit process or a limit on the device's total memory.
+
+Run `bash platform/tests/check_mem1.sh` on Linux x86_64 for a host regression
+test of the actual Android-configured runtime plus patched SDK header. It
+blocks the preferred range, verifies alternate placement/round-trips/GX
+setup, preserves sentinel mappings, tests fragmentation and upper-half
+placement, and rejects an exhausted window including the 4 GiB endpoint.
+It runs without a ROM, GPU or Android runtime. Device loading still requires
+testing; do not run the Android container/emulator for this follow-up.

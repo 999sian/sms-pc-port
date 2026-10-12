@@ -475,10 +475,13 @@ void port_install_crash_handlers()
 }
 
 // Emulated MEM1: the game's arena lives at the GameCube's own cached
-// addresses (0x80000000..), so OSPhysicalToCached/OSCachedToPhysical and the
-// few raw low-memory reads (e.g. *(OSModuleInfo**)0x800030C8) work unchanged.
+// addresses (0x80000000..) when available. Android can occupy that range;
+// its SDK translations and GX window follow a relocated compatibility arena.
 u8* port_mem1_base;
 u32 port_mem1_size;
+#ifdef __ANDROID__
+extern "C" __attribute__((weak)) void GXPC_SetMemoryWindow(void* base, uint32_t size);
+#endif
 
 #ifndef _WIN32
 // mmap exactly at `want` without replacing an existing mapping. Linux has
@@ -521,15 +524,46 @@ static void map_mem1()
 #else
 	void* p = map_exact(want, port_mem1_size);
 	if (p != want) {
+#ifdef __ANDROID__
+		port_log("[port] MEM1 address 0x80000000 unavailable; reserving another compatibility range\n");
+		p = port_low_alloc(port_mem1_size);
+		// Stacks prefer the low half, but MEM1 already normally lives at
+		// 0x80000000. If that half is fragmented, its relocated arena may use
+		// another complete range in the upper half of the 32-bit window.
+		for (uint64_t at = 0x84000000ULL; !p && at + port_mem1_size < 0x100000000ULL; at += 0x100000u) {
+			void* q = map_exact((void*)(uintptr_t)at, port_mem1_size);
+			if (q != MAP_FAILED) p = q;
+		}
+		// The game's raw u32 pointer fields and rounding helpers cannot use a
+		// high malloc/mmap block even though the host process is 64-bit.
+		if (!p || (uint64_t)(uintptr_t)p + port_mem1_size >= 0x100000000ULL) {
+			port_log("[port] could not reserve pointer-compatible MEM1; refusing an unsafe heap fallback\n");
+			exit(1);
+		}
+#else
 		port_log("[port] cannot map MEM1 at 0x80000000; falling back to a heap block\n");
 		p = mmap(NULL, port_mem1_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (p == MAP_FAILED) {
 			port_log("[port] out of memory for MEM1\n");
 			exit(1);
 		}
+#endif
+	}
+#endif
+	// ArenaHi itself is also rounded/stored through u32 by the game, so an
+	// exclusive end exactly at 4 GiB is incompatible even if all bytes fit.
+#ifdef __ANDROID__
+	if (!port_mem1_size || (uint64_t)(uintptr_t)p + port_mem1_size >= 0x100000000ULL) {
+		port_log("[port] MEM1 arena endpoints do not fit the compatibility address window\n");
+		exit(1);
 	}
 #endif
 	port_mem1_base = (u8*)p;
+#ifdef __ANDROID__
+	// FIFO/GD commands store MEM1-relative addresses. Relocation must change
+	// the renderer's default 0x80000000 window before the game emits any.
+	if (GXPC_SetMemoryWindow) GXPC_SetMemoryWindow(p, port_mem1_size);
+#endif
 	port_crash_set_mem1((uintptr_t)p, port_mem1_size);
 	port_log("[port] MEM1: %u MiB at %p\n", mb, p);
 }
@@ -574,7 +608,9 @@ void* port_low_alloc(unsigned long size)
 	}
 	return NULL;
 #else
-#ifdef MAP_32BIT
+#if defined(MAP_32BIT) && !defined(__ANDROID__)
+	// MAP_32BIT is an x86 facility. ARM64 Android uses the non-clobbering
+	// address walk below (also exercised by the Android-configured host test).
 	void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
 	if (p != MAP_FAILED)
 		return p;
@@ -582,10 +618,18 @@ void* port_low_alloc(unsigned long size)
 	static uintptr_t next = 0x40000000u;
 	for (int tries = 0; tries < 4096 && next + size <= 0x80000000u; tries++) {
 		void* want = (void*)next;
-		next += (size + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
 		void* q = map_exact(want, size);
-		if (q == want)
+		if (q == want) {
+			next += (size + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
 			return q;
+		}
+#ifdef __ANDROID__
+		// A large failed request must not skip a smaller aligned hole that
+		// still fits it between Android's existing mappings.
+		next += 0x100000u;
+#else
+		next += (size + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
+#endif
 	}
 	return NULL;
 #endif
