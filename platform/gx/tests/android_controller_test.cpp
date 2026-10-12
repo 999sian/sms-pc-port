@@ -1,6 +1,7 @@
 // Exercise the Android raw-button ABI with SDL's real virtual joystick and
 // controller mapping/event conversion. This does not start Android or video.
 #include "gx_android_controller_mapping.h"
+#include "gx_android_controller_profiles.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -17,7 +18,7 @@ static bool mappedEvent(Uint32 type, SDL_JoystickID id, int control, int value) 
     }
     return found;
 }
-int main() {
+int main(int argc, char** argv) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     assert(SDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) == 0);
     SDL_VirtualJoystickDesc desc{};
@@ -97,6 +98,61 @@ int main() {
         }
     }
     assert(!profile(0x0810,1,4,36,0,0x7800,0x000f,SDL_IsGameController(index)));
+    // Settings override the automatic profile, preserve untouched controls,
+    // and explicitly clear controls. Exercise the actual SDL remapper while
+    // the controller is open, not just the generated string.
+    gx::AndroidControllerProfile user;
+    char record[512];
+    const Uint16 crc = Uint16(guid.data[2] | Uint16(guid.data[3]) << 8);
+    assert(SDL_crc16(0,"123456789",9) == 0xbb3d); // Java descriptor CRC contract.
+    assert(SDL_crc16(0,"\xc0\x80",2) == 0xa051);
+    assert(SDL_crc16(0,"\xed\xa0\xbd\xed\xb8\x80",6) == 0x9d50);
+    SDL_snprintf(record,sizeof record,"0810:0001:%04x\ta:b20,y:none,rightx:a2~,righty:none,lefttrigger:+a0,leftx:none,",crc);
+    assert(gx::parseControllerProfile(record,user));
+    assert(gx::controllerProfileMatches(user,guid,0x0810,1));
+    assert(!gx::controllerProfileMatches(user,guid,0x0810,2));
+    SDL_JoystickGUID other = guid; other.data[2] ^= 1;
+    assert(!gx::controllerProfileMatches(user,other,0x0810,1));
+    gx::AndroidControllerProfile bad;
+    for (const char* invalid : {"0810:0001:0000\t", "0810:0001:0000\tcrc:abcd,", "0810:0001:0000\ta:b36,",
+        "0810:0001:0000\ta:b1,a:b2,", "0810:0001:0000\trightx:a9999,", "0810:0001:0000\ta:b1~,"})
+        assert(!gx::parseControllerProfile(invalid,bad));
+    assert(gx::controllerHidIgnore({user,user},"0x1234/0x0002") == "0x1234/0x0002,0x0810/0x0001");
+    gx::AndroidControllerProfile unidentified=user;unidentified.product=0;
+    assert(gx::controllerHidIgnore({unidentified},nullptr).empty());
+    assert(argc==2);
+    FILE* savedFile=std::fopen(argv[1],"w");assert(savedFile);
+    assert(std::fprintf(savedFile,"invalid line\n%s\n",record)>0);assert(std::fclose(savedFile)==0);
+    const auto savedProfiles=gx::readControllerProfiles(argv[1]);assert(savedProfiles.size()==1);
+    assert(gx::controllerProfileMatches(savedProfiles[0],guid,0x0810,1));
+    assert(savedProfiles[0].overrides==user.overrides);assert(std::remove(argv[1])==0);
+    char* baseMapping = SDL_GameControllerMapping(pad); std::string userMapping;
+    assert(gx::userControllerMapping(guid,user,4,36,baseMapping,userMapping));
+    assert(!gx::userControllerMapping(guid,user,2,36,baseMapping,userMapping));
+    assert(gx::userControllerMapping(guid,user,4,36,baseMapping,userMapping));
+    SDL_free(baseMapping);
+    assert(SDL_GameControllerAddMapping(userMapping.c_str()) >= 0);
+    assert(SDL_JoystickSetVirtualButton(raw,20,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_A) == 1);
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_Y) == 0);
+    assert(mappedEvent(SDL_CONTROLLERBUTTONDOWN,id,SDL_CONTROLLER_BUTTON_A,1));
+    assert(SDL_JoystickSetVirtualButton(raw,20,0) == 0); SDL_JoystickUpdate();
+    assert(mappedEvent(SDL_CONTROLLERBUTTONUP,id,SDL_CONTROLLER_BUTTON_A,0));
+    assert(SDL_JoystickSetVirtualButton(raw,22,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_A) == 0);
+    assert(SDL_JoystickSetVirtualButton(raw,22,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_JoystickSetVirtualButton(raw,29,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_START) == 1); // untouched default
+    assert(SDL_JoystickSetVirtualButton(raw,29,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_JoystickSetVirtualAxis(raw,2,32767) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX) == -32768);
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTY) == 0);
+    assert(SDL_JoystickSetVirtualAxis(raw,2,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_JoystickSetVirtualAxis(raw,0,32767) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_TRIGGERLEFT) == 32767);
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_LEFTX) == 0);
+    assert(SDL_JoystickSetVirtualAxis(raw,0,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_TRIGGERLEFT) == 0);
     SDL_GameControllerClose(pad); SDL_JoystickClose(raw);
     assert(SDL_JoystickDetachVirtual(index) == 0);
     // Mapping persists across a disconnect; a newly attached matching device
@@ -107,5 +163,5 @@ int main() {
     assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_A) == 0);
     SDL_GameControllerClose(pad); assert(SDL_JoystickDetachVirtual(index) == 0);
     SDL_Quit();
-    std::puts("PASS Android legacy mapping: exclusions, raw numbered buttons, digital triggers, D-pad, sticks, releases, mapped events and reconnect");
+    std::puts("PASS Android controller mapping: legacy input, saved overrides, clears, untouched defaults, device identity, malformed profiles, inversion, triggers, events and reconnect");
 }

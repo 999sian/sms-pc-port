@@ -34,6 +34,7 @@ extern "C" void port_android_performance_shutdown(void) __attribute__((weak));
 #include <SDL.h>
 #ifdef __ANDROID__
 #include "gx_android_controller_mapping.h"
+#include "gx_android_controller_profiles.h"
 #endif
 #ifdef _WIN32
 #include <SDL_syswm.h>
@@ -278,6 +279,13 @@ bool openWindow(float scale) {
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_GAMECUBE", "1");
     SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
 #ifdef __ANDROID__
+    // Captured settings use Android's key/axis numbering, so configured
+    // VID/PID pairs use that backend rather than HIDAPI's different raw ABI.
+    const auto profiles = gx::readControllerProfiles(getenv("SMS_ANDROID_CONTROLLER_MAPPINGS"));
+    if (!profiles.empty()) {
+        const std::string ignored = gx::controllerHidIgnore(profiles, SDL_GetHint(SDL_HINT_HIDAPI_IGNORE_DEVICES));
+        SDL_SetHintWithPriority(SDL_HINT_HIDAPI_IGNORE_DEVICES, ignored.c_str(), SDL_HINT_OVERRIDE);
+    }
     // SDL's resizable-window default otherwise overrides the Activity's
     // landscape orientation with full sensor rotation.
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
@@ -833,11 +841,34 @@ static void noteInputDevice(const SDL_Event& ev) {
 #endif
 
 #ifdef SMS_GX_HAVE_SDL2
+#ifdef __ANDROID__
+static bool applyUserAndroidPad(int index) {
+    static const auto profiles = gx::readControllerProfiles(getenv("SMS_ANDROID_CONTROLLER_MAPPINGS"));
+    if (profiles.empty()) return false;
+    const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(index);
+    const Uint16 axisMask = Uint16(guid.data[14] | Uint16(guid.data[15]) << 8);
+    const Uint16 layout = axisMask & 0x7fff;
+    if ((layout != 0 && layout != 3 && layout != 15 && layout != 63) || (guid.data[0] != 5 || guid.data[1] != 0)) return false;
+    const Uint16 vendor = SDL_JoystickGetDeviceVendor(index), product = SDL_JoystickGetDeviceProduct(index);
+    for (const auto& profile : profiles) if (gx::controllerProfileMatches(profile,guid,vendor,product)) {
+        SDL_Joystick* raw = SDL_JoystickOpen(index); if (!raw) return false;
+        char* base = SDL_GameControllerMappingForDeviceIndex(index); std::string mapping;
+        const bool valid = gx::userControllerMapping(guid,profile,SDL_JoystickNumAxes(raw),SDL_JoystickNumButtons(raw),base,mapping);
+        const bool added = valid && SDL_GameControllerAddMapping(mapping.c_str()) >= 0;
+        logmsg("Android configured controller %04x:%04x: %s",vendor,product,added ? mapping.c_str() : "assignments unavailable for this input layout");
+        SDL_free(base); SDL_JoystickClose(raw); return added;
+    }
+    return false;
+}
+#endif
 static void openPad(int index) {
     const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
     if (id < 0) return;
     for (SDL_GameController* pad : s_pads)
         if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) == id) return;
+#ifdef __ANDROID__
+    applyUserAndroidPad(index);
+#endif
     if (SDL_IsGameController(index)) {
         if (SDL_GameController* pad = SDL_GameControllerOpen(index)) {
             s_pads.push_back(pad);
@@ -880,7 +911,8 @@ void sms_gx_pump_events(void) {
             // The original joystick-add event has already passed SDL's
             // controller filter. Adding a mapping does not post another add,
             // so open this controller now; duplicate opens are guarded.
-            if (addLegacyAndroidPad(ev.jdevice.which)) openPad(ev.jdevice.which);
+            addLegacyAndroidPad(ev.jdevice.which);
+            openPad(ev.jdevice.which);
             break;
 #endif
         case SDL_CONTROLLERDEVICEADDED:

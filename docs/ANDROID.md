@@ -261,3 +261,29 @@ recognition, numbered-button/controller events, digital trigger pressure,
 D-pad/sticks/releases, instance IDs and reconnect. Physical layout confirmation
 is still needed, especially shoulder assignments and right-stick orientation.
 The launcher's Input test remains useful for collecting that report.
+
+
+Preview 18 supports user-configured layouts from the launcher's Controller
+configuration screen. Saved per-descriptor overrides arrive in a private file
+on each Play, identified by VID/PID and SDL's descriptor CRC. Native code
+validates targets, bounded button/axis expressions and live device counts,
+then merges only edited controls into the automatic mapping. `none` explicitly
+unbinds a control; removing the profile restores automatic behavior next Play.
+Unmapped devices can be opened after a player supplies assignments. Matching
+uses stable descriptor identity rather than ephemeral Android input IDs.
+
+The launcher's captured key/axis indices use SDL's Android backend. Nonzero
+configured VID/PID pairs are added to SDL's existing HID ignore list before
+initialization so they cannot use HIDAPI's different raw numbering. This
+routing applies to matching model pairs; custom mode uses Android events and
+has no SDL controller rumble. Unknown product-zero IDs never form wildcards.
+Ordinary unconfigured models preserve their driver/mapping. Device Back can
+be explicitly bound; system navigation Back still returns to the launcher.
+
+Host Java checks cover Android raw buttons, SDL axis order, trigger rest/range,
+inversion, CRC and serialized entries. Host SDL virtual-controller checks cover
+profile file parsing/identity, malformed/out-of-range exclusion, override and
+clear semantics, preserved defaults, events, inverted camera and half-axis
+trigger calibration. Existing graphics checks and Android builds are separate.
+No Android container/emulator is run. Configuration UI/capture/persistence and
+physical gameplay application need tester validation; no FPS change is claimed.
