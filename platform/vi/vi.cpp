@@ -324,6 +324,7 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
         return e && *e && strcmp(e, "0") != 0;
     }();
     bool backgroundYield = false;
+    double backgroundSeconds = 0;
 #endif
 	bool waited = false;
 	while ((s32)(VIGetRetraceCount() - due) < 0) {
@@ -333,11 +334,12 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 #ifdef __ANDROID__
 	// Android presentation can consume the whole retrace interval. Skipping
 	// the SDK wait then keeps the main thread runnable forever, starving the
-	// lower-priority stage loader. Sleep for one retrace only when background
-	// work needs the emulated CPU and this frame has not already yielded it.
+	// lower-priority stage loader. Give that work a short cooperative turn,
+	// returning as soon as it blocks; do not add an idle retrace to a late frame.
 	if (!waited && port_os_background_ready()) {
-        backgroundYield = true;
-		VIWaitForRetrace();
+        const double start = logTiming ? seconds_now() : 0;
+        backgroundYield = port_os_yield_background(1000000); // 1 ms at SDK checkpoints
+        if (logTiming) backgroundSeconds = seconds_now() - start;
     }
 #else
 	(void)waited;
@@ -351,14 +353,20 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
     if (logTiming) {
         static unsigned samples = 0, yields = 0;
         static double totalWait = 0, maxWait = 0, budget = 0;
-        if (budget != period) { samples = yields = 0; totalWait = maxWait = 0; budget = period; }
+        static double totalBackground = 0, maxBackground = 0;
+        if (budget != period) {
+            samples = yields = 0; totalWait = maxWait = totalBackground = maxBackground = 0; budget = period;
+        }
         const double wait = seconds_now() - entry;
         totalWait += wait; maxWait = std::max(maxWait, wait);
         yields += backgroundYield;
+        totalBackground += backgroundSeconds; maxBackground = std::max(maxBackground, backgroundSeconds);
         if (++samples == 120) {
-            fprintf(stderr, "[android] SDK pacing: %u frames, budget %.2f ms, wait avg %.2f/max %.2f ms, background yields %u\n",
-                    samples, period * 1000, totalWait / samples * 1000, maxWait * 1000, yields);
-            samples = yields = 0; totalWait = maxWait = 0;
+            fprintf(stderr, "[android] SDK pacing: %u frames, budget %.2f ms, wait avg %.2f/max %.2f ms, "
+                            "background yields %u, background avg %.2f/max %.2f ms\n",
+                    samples, period * 1000, totalWait / samples * 1000, maxWait * 1000, yields,
+                    totalBackground / samples * 1000, maxBackground * 1000);
+            samples = yields = 0; totalWait = maxWait = totalBackground = maxBackground = 0;
         }
     }
 #endif

@@ -57,9 +57,13 @@ NDK's `llvm-addr2line`.
 The launcher isolates each game session in its own process. Closing its SDL
 window releases the renderer, flushes the game log, and ends that process
 without running global destructors alongside still-running SDK workers.
-The next Play starts with fresh heaps, threads, and caches. Android frame waits
-also yield a retrace when lower-priority resource loading is runnable, so
-a slow presentation cannot starve the stage loader after movies.
+The next Play starts with fresh heaps, threads, and caches. If an Android
+frame is already due and lower-priority SDK work is runnable, frame pacing
+temporarily blocks the frame producer for a cooperative background turn.
+It resumes when workers block/exit, or at a scheduling checkpoint after a
+1 ms budget. This preserves stage-loader progress after movies without
+forcing a late frame to wait for another retrace. The budget does not
+preempt uninterrupted native code; workers must reach SDK checks/yields.
 
 For renderer diagnostics, `SMS_GX_FINISH_BEFORE_SWAP=1` forces `glFinish`
 before presentation and logs render-completion wait and buffer-swap time
@@ -147,5 +151,24 @@ Requested/effective CPU masks or the fallback reason are logged. The host test
 `platform/android/tests/test_performance_cores.cpp` covers big+prime tiers,
 sparse/permuted IDs, incomplete metadata, homogeneous/already-fast masks,
 a lone prime, the threshold boundary and arithmetic overflow. No v11 Android
-runtime or performance validation has been performed; the candidate needs a
-physical-device comparison, not an ARM64-translating container benchmark.
+runtime or performance validation has been performed locally; the candidate
+needs a physical-device comparison, not an ARM64-translating container benchmark.
+
+The S24 Ultra tester confirmed v11 applied the requested faster-core mask,
+but reported unchanged performance with that option alone. Hints/headroom
+combinations also had no effect. Their all-options-off timing log shows
+roughly 11–13 ms average frame work and 0.5–0.6 ms swaps, yet frequent
+33–35 ms frames and 29–66 forced background yields per 120 frames. Frequency
+samples reach 3.15 GHz. These measurements support investigating the extra
+retrace in our old background fallback rather than attributing every drop
+to low clocks. Timing windows are not perfectly aligned and CPU frequencies
+are point samples; these logs do not establish the cause of every slow frame.
+
+v12 replaces that fallback with the short cooperative handoff above.
+SDK-pacing logs additionally report background-handoff average/max wall time.
+Run `bash platform/os/tests/check_background_yield.sh` on a Linux x86_64 host
+to test the Android-configured scheduler and actual frame-wait path without
+a ROM, graphics context or VI timer. It checks worker progress, early return,
+deadline handling through yields and IRQ polls, priority, IRQ state, guards
+and worker exit. An already-due frame must return without another retrace.
+This is host regression coverage; device loading/FPS require tester validation.

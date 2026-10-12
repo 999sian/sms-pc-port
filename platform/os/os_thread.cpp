@@ -59,6 +59,11 @@ int g_sched_disabled;
 std::atomic<int> g_irq_kicks(0);
 std::deque<std::function<void()> > g_deferred;
 std::vector<port_irq_poll_fn> g_sources;
+#ifdef __ANDROID__
+OSThread* g_background_waiter;
+u64 g_background_deadline, g_background_budget;
+bool g_background_started;
+#endif
 
 Host* host_of(OSThread* t)
 {
@@ -209,6 +214,23 @@ u64 spin_clock_ns()
 #endif
 }
 
+#ifdef __ANDROID__
+// The render thread temporarily blocks to let lower-priority work progress.
+// Resume it when that work becomes quiescent, or at a scheduling checkpoint
+// after its budget. Waiting for another VI interrupt would waste a field.
+bool wake_background_waiter(bool idle)
+{
+	if (!g_background_waiter || (!idle && (!g_background_started || spin_clock_ns() < g_background_deadline)))
+		return false;
+	OSThread* waiter = g_background_waiter;
+	g_background_waiter = NULL;
+	if (waiter->state != OS_THREAD_STATE_WAITING)
+		return false;
+	waiter->state = OS_THREAD_STATE_READY;
+	return true;
+}
+#endif
+
 static inline void cpu_relax()
 {
 #if defined(__x86_64__) || defined(__i386__)
@@ -245,6 +267,14 @@ bool spin_for_turn(OSThread* self)
 // again, or never if `self` is exiting.
 void switch_to(OSThread* self, OSThread* next, bool exiting)
 {
+#ifdef __ANDROID__
+	// Start the budget when selecting the first lower-priority worker, after
+	// any higher-priority work. It gets a turn even if the host wakes it late.
+	if (g_background_waiter && !g_background_started && next->priority > g_background_waiter->priority) {
+		g_background_deadline = spin_clock_ns() + g_background_budget;
+		g_background_started = true;
+	}
+#endif
 	Host* hs = self ? host_of(self) : NULL;
 	if (hs)
 		hs->irq_enabled = g_irq_enabled;
@@ -340,6 +370,10 @@ void reschedule(bool yield)
 		next = pick(self, yield);
 		if (next)
 			break;
+#ifdef __ANDROID__
+		if (wake_background_waiter(true))
+			continue;
+#endif
 		// Idle: every thread is blocked. Wait for an interrupt source (or, with
 		// a deterministic clock, make the next retrace happen now).
 		if (port_vi_idle_advance())
@@ -391,6 +425,9 @@ void deliver_irqs()
 		g_deferred.pop_front();
 		fn();
 	}
+#ifdef __ANDROID__
+	wake_background_waiter(false);
+#endif
 	g_in_irq = false;
 }
 
@@ -452,8 +489,14 @@ extern "C" void port_irq_check(void)
 {
 	if (!g_irq_enabled || g_in_irq)
 		return;
-	if (g_irq_kicks.load() == 0 && g_deferred.empty())
+	if (g_irq_kicks.load() == 0 && g_deferred.empty()) {
+#ifdef __ANDROID__
+		if (!g_background_waiter || !g_background_started || spin_clock_ns() < g_background_deadline)
+			return;
+#else
 		return;
+#endif
+	}
 	deliver_irqs();
 	if (g_need_resched || true)
 		preempt_check();
@@ -558,6 +601,23 @@ extern "C" int port_os_background_ready(void)
 	return 0;
 }
 
+#ifdef __ANDROID__
+extern "C" int port_os_yield_background(u64 budget_ns)
+{
+	if (!budget_ns || g_background_waiter || !port_os_background_ready())
+		return 0;
+	const BOOL interrupts = OSDisableInterrupts();
+	OSThread* self = g_cur;
+	g_background_waiter = self;
+	g_background_budget = budget_ns;
+	g_background_started = false;
+	self->state = OS_THREAD_STATE_WAITING;
+	reschedule(false);
+	OSRestoreInterrupts(interrupts);
+	return 1;
+}
+#endif
+
 extern "C" BOOL OSIsThreadTerminated(OSThread* t)
 {
 	return t->state == OS_THREAD_STATE_MORIBUND || t->state == 0;
@@ -629,6 +689,10 @@ extern "C" void OSExitThread(OSThread* valArg)
 		next = pick(NULL, true);
 		if (next)
 			break;
+#ifdef __ANDROID__
+		if (wake_background_waiter(true))
+			continue;
+#endif
 		if (port_vi_idle_advance())
 			continue;
 		struct timespec ts;
@@ -641,6 +705,10 @@ extern "C" void OSExitThread(OSThread* valArg)
 
 extern "C" void OSCancelThread(OSThread* t)
 {
+#ifdef __ANDROID__
+	if (g_background_waiter == t)
+		g_background_waiter = NULL;
+#endif
 	if (t == g_cur) {
 		OSExitThread(NULL);
 		return;
