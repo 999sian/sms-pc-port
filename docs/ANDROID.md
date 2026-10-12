@@ -220,3 +220,21 @@ setup, preserves sentinel mappings, tests fragmentation and upper-half
 placement, and rejects an exhausted window including the 4 GiB endpoint.
 It runs without a ROM, GPU or Android runtime. Device loading still requires
 testing; do not run the Android container/emulator for this follow-up.
+
+
+v16 corrects two J3D display-list writers that used `OSPhysicalToCached`
+on an already-cached texture/palette pointer as a retail-address shortcut.
+It happened to yield an arena offset at 0x80000000 after u32 truncation,
+but fails at relocated addresses such as the tester's 0x40800000. Android
+now uses `OSCachedToPhysical` before packing the texture-image/TLUT load
+commands. The register IDs, palette selection/flush sequence and desktop
+writers are preserved. This addresses the remaining bad texture addresses;
+actual image recovery after the intro still requires device confirmation.
+
+`bash platform/tests/check_j3d_addresses.sh` compiles the actual JRenderer
+writers and Android SDK patch, confirms the old writers fail relocation,
+then checks emitted texture/palette bytes, all eight texture slots, aligned
+addresses across a 64 MiB arena at preferred and relocated bases, round trips
+through the GPU address format, bounds and the palette command sequence.
+It also checks the unchanged desktop path at its original base. No ROM or
+Android runtime is run. v15 artifacts remain unchanged.
