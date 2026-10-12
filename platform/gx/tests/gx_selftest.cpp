@@ -198,6 +198,29 @@ int main(int argc, char** argv) {
     expectPixel("vertex colour quad", 30, 30, 255, 0, 0);
     expectPixel("outside the quad", 70, 70, 32, 48, 64);
 
+    // The GLES clipping adapter must compile and retain both GX clip planes.
+    // Adreno rejected a standalone gl_ClipDistance redeclaration; removing
+    // it must not turn clipping off. Exercise the extension with real pixels.
+    bool clipDistances = true;
+#ifdef __ANDROID__
+    clipDistances = false;
+    GLint extensionCount = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
+    for (GLint i = 0; i < extensionCount; ++i) {
+        const char* extension = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, GLuint(i)));
+        if (extension && !strcmp(extension, "GL_EXT_clip_cull_distance")) clipDistances = true;
+    }
+#endif
+    if (clipDistances) {
+        GXSetClipMode(GX_CLIP_ENABLE);
+        colorQuad(100, 10, 140, 50, 255, 0, 0, 255, -11);
+        expectPixel("GX far clip rejects outside geometry", 120, 30, 32, 48, 64);
+        colorQuad(150, 10, 190, 50, 255, 0, 0, 255, 1);
+        expectPixel("GX near clip rejects outside geometry", 170, 30, 32, 48, 64);
+        colorQuad(200, 10, 240, 50, 0, 255, 0, 255, -5);
+        expectPixel("GX clip retains inside geometry", 220, 30, 0, 255, 0);
+    }
+
     // 2. textured quad with a two-stage TEV (texture*ras, then *konst)
     {
         u8 img[8 * 8 * 4];

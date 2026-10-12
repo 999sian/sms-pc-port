@@ -289,8 +289,10 @@ std::string shaderSource(const std::string& source, unsigned type) {
     if (type == GL_VERTEX_SHADER && clipDistance && s.find("gl_ClipDistance") != std::string::npos)
         header += "#extension GL_EXT_clip_cull_distance : require\n";
     header += "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\n";
-    if (type == GL_VERTEX_SHADER && clipDistance && s.find("gl_ClipDistance") != std::string::npos)
-        header += "out float gl_ClipDistance[2];\n";
+    // EXT_clip_cull_distance predeclares this built-in array. Our constant
+    // indices [0] and [1] size it implicitly, as the extension permits. An
+    // explicit standalone redeclaration is rejected by Adreno 750 drivers.
+    // Keep the extension and writes; do not disable the game's clip planes.
     replace(s, "#version 330 core\n", header);
     replace(s, "#extension GL_ARB_shader_image_load_store : require\n", "");
     if (type == GL_VERTEX_SHADER) {

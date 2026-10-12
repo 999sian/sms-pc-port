@@ -565,7 +565,7 @@ static GLuint compile(GLenum type, const std::string& src) {
     if (!ok) {
         char log[4096];
         glGetShaderInfoLog(sh, sizeof log, nullptr, log);
-        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, src.c_str());
+        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, adapted.c_str());
     }
     return sh;
 }

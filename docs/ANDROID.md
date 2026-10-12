@@ -38,6 +38,9 @@ Color logic operations use a destination snapshot per primitive. Numeric
 pixel metrics use SSBO counters and ordered drawing, preserving counts that
 GLES boolean visibility queries cannot provide. MSAA stays off on Android.
 Clip distances and depth clamp use their GLES extensions when available.
+The clipping extension predeclares `gl_ClipDistance`; constant indices size
+its array implicitly. Avoid a standalone redeclaration, which the Adreno
+750 V@0762.41 driver rejects with a reserved-built-in-name compile error.
 Without those extensions the vertex shader clamps forward-facing depth;
 this fallback passes the shared graphics tests but is not a substitute for
 testing every scene on each device's driver.
