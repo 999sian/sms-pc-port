@@ -93,13 +93,16 @@ comparison (`SMS_ANDROID_PERFORMANCE_HINTS=0`). The **Show performance overlay**
 switch reports our own frame rate/timings rather than only SurfaceFlinger FPS.
 A device's game policies and clocks remain under Android/OEM control.
 
-The default-on **Request performance headroom** setting requests 80% of the
+The opt-in **Request performance headroom** setting requests 80% of the
 actual frame interval as the ADPF work deadline (13.35 ms at nominal 60 FPS),
 reserving 20% for presentation/scheduling variation. Measurements remain
 unaltered and game cadence is unchanged. `SMS_ANDROID_PERFORMANCE_HEADROOM=0`
 restores the v8 full-frame deadline. This candidate is intended to test whether
 an earlier deadline improves the tester's low-clock behavior; it has not been
-validated on Samsung hardware. Android 15's optional power-efficiency setting
+validated on Samsung hardware. The tester reported v9 was substantially
+slower, near 30 FPS until a screenshot boosted it, so v10 defaults to the
+original full-frame deadline and no display-cadence request. The cause of
+that regression is unverified. Android 15's optional power-efficiency setting
 is explicitly set false on each new session; false is already the OS default,
 so this is not itself evidence of a boost. Errors in that optional request do
 not discard a working basic hint session.

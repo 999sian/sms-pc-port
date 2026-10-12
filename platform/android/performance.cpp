@@ -12,7 +12,7 @@
 namespace {
 std::atomic<int32_t> renderTid{0};
 port_android::HintSession* hints = nullptr;
-bool initialized = false, unavailable = false, logTiming = false, headroom = true;
+bool initialized = false, unavailable = false, logTiming = false, headroom = false;
 int32_t frameTid = 0, sessionGameTid = 0, sessionRenderTid = 0;
 int64_t frameStart = 0, cpuStart = 0, frameTarget = 0, sessionTarget = 0;
 unsigned samples = 0;
@@ -42,7 +42,9 @@ void initialize() {
     const char* logging = getenv("SMS_TIMING_LOG");
     logTiming = logging && *logging && logging[0] != '0';
     const char* reserve = getenv("SMS_ANDROID_PERFORMANCE_HEADROOM");
-    headroom = !reserve || reserve[0] != '0';
+    // v9's stronger request regressed on the tester's device. Keep the
+    // original full-frame target unless the player explicitly opts in.
+    headroom = reserve && *reserve && reserve[0] != '0';
     const char* enabled = getenv("SMS_ANDROID_PERFORMANCE_HINTS");
     if (enabled && enabled[0] == '0') {
         unavailable = true;
