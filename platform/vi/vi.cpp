@@ -15,6 +15,9 @@
 #include <string>
 #include <sys/stat.h>
 #include "port_host.h"
+#ifdef __ANDROID__
+#include "port_android_performance.h"
+#endif
 
 // Frame capture (SMS_SHOTS=field,field,... SMS_SHOT_DIR=dir): the XFB handed to
 // VISetNextFrameBuffer is read back through the GX layer at the first VIFlush
@@ -307,6 +310,11 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 		VIWaitForRetrace();
 		return (s32)VIGetRetraceCount() + frames;
 	}
+#ifdef __ANDROID__
+    // Finish work before the SDK's pacing wait, then begin the next cycle
+    // after that wait. Do not report the intentional retrace sleep as work.
+    port_android_performance_frame_end();
+#endif
 	const double entry = seconds_now();
 	if (ready > 0)
 		work += (entry - ready - (GXPC_LastPresentSeconds ? GXPC_LastPresentSeconds() : 0) - work) * 0.1;
@@ -336,6 +344,9 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 	if (GXPC_SkipNextPresent)
 		GXPC_SkipNextPresent(skip);
 	ready = seconds_now();
+#ifdef __ANDROID__
+    port_android_performance_frame_begin(int64_t(period * 1000000000));
+#endif
 	return due + frames;
 }
 

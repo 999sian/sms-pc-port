@@ -15,6 +15,11 @@
 #include <string.h>
 #include <time.h>
 #include <vector>
+#ifdef __ANDROID__
+extern "C" void port_android_performance_render_thread(void) __attribute__((weak));
+extern "C" void port_android_performance_pause(void) __attribute__((weak));
+extern "C" void port_android_performance_shutdown(void) __attribute__((weak));
+#endif
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <sys/stat.h>
 #include <unistd.h>
@@ -428,7 +433,12 @@ bool openWindow(float scale) {
     }
     // the context moves to the GL thread (gx_glthread.h)
     SDL_GL_MakeCurrent(s_window, nullptr);
-    if (glt::start([](void*) { SDL_GL_MakeCurrent(s_window, s_glctx); }, nullptr)) glt::installProxies();
+    if (glt::start([](void*) {
+        SDL_GL_MakeCurrent(s_window, s_glctx);
+#ifdef __ANDROID__
+        if (port_android_performance_render_thread) port_android_performance_render_thread();
+#endif
+    }, nullptr)) glt::installProxies();
     else SDL_GL_MakeCurrent(s_window, s_glctx);
     return true;
 }
@@ -899,6 +909,10 @@ void sms_gx_pump_events(void) {
             syncCheatMenuInput();
             continue;
         }
+#ifdef __ANDROID__
+        if (ev.type == SDL_APP_WILLENTERBACKGROUND && port_android_performance_pause)
+            port_android_performance_pause();
+#endif
         if (s_eventCb) s_eventCb(&ev);
         if (ev.type == SDL_QUIT ||
             (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE)) {
@@ -908,6 +922,7 @@ void sms_gx_pump_events(void) {
             // The launcher runs each game session in its own process. SDK
             // worker threads still reference global mutexes; exit() would
             // destroy those globals while the workers are running.
+            if (port_android_performance_shutdown) port_android_performance_shutdown();
             fflush(stdout);
             fflush(stderr);
             _Exit(0);

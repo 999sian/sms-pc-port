@@ -72,3 +72,23 @@ Validation must include installing the actual ARM64 APK, title/file selection,
 an imported save, stage gameplay and unskipped movies. ARM64 translation in
 an Android emulator is suitable for correctness checks, but physical handheld
 testing is still needed for performance, thermal behavior and controller feel.
+
+Android 12+ performance hints register the SDK thread producing frames and
+its GL worker when enabled (Android normally keeps both on one thread) with APerformanceHintManager. Each SDK frame wait reports the
+work cycle since the last wait ended, then starts the next cycle after the
+intentional pacing sleep. The budget follows the actual retrace count per
+frame (including 30 fps menus/movies and 60 fps gameplay). Work includes
+synchronous driver/graphics waits; it is not a GPU timestamp or CPU utilization
+counter. These advisory CPU scheduling hints do not lock clocks or override
+thermal limits. Missing/rejected APIs disable the session once without
+changing game timing. Runtime symbol lookup keeps Android 10/11 supported.
+Backgrounding closes the session and discards partial frame timing; returning
+recreates it. Normal game shutdown explicitly closes the session. See
+`platform/android/tests/test_performance_session.cpp` for thread-group,
+budget-update, pause/resume and service-failure checks.
+
+The Android launcher declares the application category as game. Its
+**Android performance hints** switch defaults on; switch it off for a device
+comparison (`SMS_ANDROID_PERFORMANCE_HINTS=0`). The **Show performance overlay**
+switch reports our own frame rate/timings rather than only SurfaceFlinger FPS.
+A device's game policies and clocks remain under Android/OEM control.
