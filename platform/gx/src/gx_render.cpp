@@ -6,6 +6,7 @@
 #include "gx_glcache.h"
 #include "gx_android.h"
 #include "gx_glthread.h"
+#include "gx_screen_extent.h"
 #include "gx_nis_coef.h"
 #include "sms_gx/gx_pc.h"
 
@@ -82,6 +83,7 @@ float efbScale() { return s_scale; }
 // scaled by 1 / s_wide: its field of view widens, and what the game placed
 // at x lands on x + s_ox, beside the centred HUD.
 static float s_wide = 1.0f;
+static float s_wideCamAspect;
 static int s_efbW = EFB_W, s_ox = 0;
 struct XMap {
     float a = 1, b = 0, clip = 1;
@@ -1960,41 +1962,14 @@ static void pixMetricResume() {
 // positions, position matrices and the projection and viewport.
 static void screenExtent(float sx, float cx, float* outLo, float* outHi) {
     const VtxFmtLayout& l = vtxFmtLayout(s_bfmt);
-    float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1);
-    bool ortho = g.xfReg[XFR_PROJ + 6] & 1;
-    uint32_t defIdx = g.xfReg[XFR_MATIDX_A] & 63;
-    float lo = 1e30f, hi = -1e30f;
-    auto vertexAt = [](uint32_t v) -> const uint8_t* {  // the batch's v-th vertex: streamed ones, then arena runs
-        if (v < s_bcount) return s_bdata.data + size_t(v) * s_bstride;
-        v -= s_bcount;
-        for (const BatchSeg& sg : s_segs) {
-            if (!sg.arena) continue;
-            if (v < sg.nverts) return sg.verts + size_t(v) * s_bstride;
-            v -= sg.nverts;
-        }
-        return nullptr;
-    };
-    for (uint32_t v = 0; v < s_bcount + s_barenaVerts; v++) {
-        const uint8_t* vx = vertexAt(v);
-        float pos[3];
-        memcpy(pos, vx, 12);
-        uint32_t idx = (s_bfmt & VF_MTX) ? (vx[l.mtx] & 63) : defIdx;
-        float m[12];
-        memcpy(m, &g.xfMem[idx * 4], 48);
-        float x = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
-        float X;
-        if (ortho) {
-            X = cx + sx * (p0 * x + p1);
-        } else {
-            float z = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
-            if (z > -1e-6f) continue;  // behind the eye
-            X = cx + sx * (p0 * x + p1 * z) / -z;
-        }
-        lo = std::min(lo, X);
-        hi = std::max(hi, X);
-    }
-    *outLo = lo;
-    *outHi = hi;
+    ScreenExtent extent(sx, cx, xff(XFR_PROJ), xff(XFR_PROJ + 1), g.xfReg[XFR_PROJ + 6] & 1, g.xfMem);
+    const int matrixOffset = (s_bfmt & VF_MTX) ? int(l.mtx) : -1;
+    const uint32_t defIdx = g.xfReg[XFR_MATIDX_A] & 63;
+    extent.append(s_bdata.data, s_bcount, s_bstride, matrixOffset, defIdx);
+    for (const BatchSeg& sg : s_segs)
+        if (sg.arena) extent.append(sg.verts, sg.nverts, s_bstride, matrixOffset, defIdx);
+    *outLo = extent.lo;
+    *outHi = extent.hi;
 }
 
 // How the current batch's game coordinates map into the widened EFB.
@@ -2013,6 +1988,10 @@ static XMap drawXMap() {
     }
     if ((g.xfReg[XFR_PROJ + 6] & 1) == 0) {  // perspective
         if (s_hud) {  // a 3D part of the HUD (the water tank): moved like the rest
+            if (s_hudAnchor >= 0.0f) { // the enclosing pane already determines placement
+                m.b = centredOffset(s_hudAnchor);
+                return m;
+            }
             float lo, hi;
             screenExtent(sx, cx, &lo, &hi);
             if (lo <= hi) m.b = centredOffset((lo + hi) / 2);
@@ -2021,7 +2000,7 @@ static XMap drawXMap() {
         m.a = s_wide;
         float p00 = xff(XFR_PROJ), p11 = xff(XFR_PROJ + 2);
         float aspect = p00 != 0.0f ? fabsf(p11 / p00) : 0.0f;
-        if (aspect < kCamAspect * sqrtf(s_wide)) m.clip = 1.0f / s_wide;  // not widened by the game
+        if (aspect < s_wideCamAspect) m.clip = 1.0f / s_wide;  // not widened by the game
         return m;
     }
     // 2D across the whole width: artwork (menus, the map, movies: colour
@@ -2041,6 +2020,13 @@ static XMap drawXMap() {
         uint32_t tw = (img0 & 0x3FF) + 1, th = ((img0 >> 10) & 0x3FF) + 1;
         int cw, ch;
         if (ptr && tw >= 32 && th >= 32 && !efbCopyLookup(ptr, &cw, &ch)) artwork = true;
+    }
+    // Artwork is centred regardless of its bounds unless HUD edge placement
+    // needs its position. Avoid transforming every vertex to learn the same
+    // offset already known here (menus, text and ordinary centred HUD pieces).
+    if (artwork && !s_hud) {
+        m.b = float(s_ox);
+        return m;
     }
     float lo, hi;
     screenExtent(sx, cx, &lo, &hi);
@@ -3142,6 +3128,7 @@ void GXPC_SetStretch2D(int on) {
 void GXPC_SetWidescreen(float widthOver43) {
     if (s_ready) return;  // the EFB size is fixed once it exists
     s_wide = widthOver43 > 1.0f ? widthOver43 : 1.0f;
+    s_wideCamAspect = kCamAspect * sqrtf(s_wide);
 }
 float GXPC_GetWidescreen(void) { return s_wide; }
 

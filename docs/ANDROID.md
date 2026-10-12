@@ -172,3 +172,24 @@ a ROM, graphics context or VI timer. It checks worker progress, early return,
 deadline handling through yields and IRQ polls, priority, IRQ state, guards
 and worker exit. An already-due frame must return without another retrace.
 This is host regression coverage; device loading/FPS require tester validation.
+
+The tester reports v12 is much faster and supplies sustained nominal-60 FPS
+4:3 gameplay (about 12.6–12.8 ms average work), with hints/cores disabled.
+Their widescreen log still has roughly 55–60 FPS sections with 17–18 ms work.
+These are not a controlled matching-camera benchmark and frequency samples
+do not identify the cause of every slow frame.
+
+v13 reduces CPU work in widescreen draw placement. Known centred artwork
+and pane-anchored 3D HUD pieces bypass unnecessary screen-bound transforms.
+The remaining scans visit each cached vertex run once and reuse consecutive
+position matrices, preserving arithmetic order. Projection-aspect threshold
+calculation moves to widescreen setup. Compilation and floating-point rules
+are preserved. A broader -O3 experiment exposed graphics failures with the
+optional GL worker on the host and is not included in this candidate.
+Resolution, FOV, frame targets and clock policy are unchanged. Timing logs
+add existing vertex/draw/texture/copy/peek timers to identify remaining costs.
+Host gx_extent_test compares 1500 varied fixtures bit-for-bit with the prior
+algorithm; gx_widescreen_test validates real rendered placement at 1x/2x.
+Its CPU routine benchmark measures only bounds scanning, not device FPS.
+Physical-device performance still requires comparison; do not run the
+Android container/emulator for this follow-up.

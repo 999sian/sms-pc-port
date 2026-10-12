@@ -84,6 +84,8 @@ struct FrameClock {
                 gx::logmsg("timing: game %.2f FPS, shown %.2f FPS, frame %.2f ms avg/%.2f ms worst; "
                            "game %.2f, GX %.2f, present %.2f, swap %.2f, idle %.2f, explicit GPU waits %.2f ms/frame",
                            fps, shownFps, avgMs, maxMs, gameMs, per.gx, per.present, per.swap, per.idle, per.gpuWait);
+                gx::logmsg("GX breakdown: vertices %.2f, draws %.2f, textures %.2f, copies %.2f, peeks %.2f ms/frame",
+                           per.vertices, per.draws, per.textures, per.copies, per.peeks);
                 lastLog = t;
             }
             atWindow = now;
