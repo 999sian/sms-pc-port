@@ -125,3 +125,27 @@ no overlay bitmap is drawn or uploaded for logging alone. Logging has some
 overhead. These are not asynchronous GPU timestamps. Use a stationary scene
 and export the log after 30 seconds without recording, notifications or screen
 touches; export before another Play replaces it.
+
+
+`SMS_ANDROID_PERFORMANCE_CORES=1` (launcher **Use performance CPU cores**)
+is an independent, default-off core-placement experiment. The current frame
+producer and optional GL worker query their own allowed CPU mask and rank
+those CPUs using complete `cpu_capacity` metadata, falling back to complete
+`cpufreq/cpuinfo_max_freq` metadata. Ranking sources are never mixed. The
+selected group includes cores at least 75% of the peak ranking, only when
+it is a distinct subset with at least two CPUs. Uniform or missing topology,
+an already-fast/narrow allowed mask, a lone prime or syscall rejection leaves
+placement unchanged. CPU IDs are discovered, not hard-coded. This influences
+where frame work runs; Android still chooses clocks and applies power/thermal
+policy. Helpers/UI are not explicitly assigned a new mask; any threads later
+created by a restricted thread inherit its Linux affinity normally.
+
+The policy runs once per participating native thread before hint initialization,
+so ADPF can be disabled for a core-placement comparison. The launcher uses a
+fresh game process for each Play, so toggling off discards the prior restriction.
+Requested/effective CPU masks or the fallback reason are logged. The host test
+`platform/android/tests/test_performance_cores.cpp` covers big+prime tiers,
+sparse/permuted IDs, incomplete metadata, homogeneous/already-fast masks,
+a lone prime, the threshold boundary and arithmetic overflow. No v11 Android
+runtime or performance validation has been performed; the candidate needs a
+physical-device comparison, not an ARM64-translating container benchmark.

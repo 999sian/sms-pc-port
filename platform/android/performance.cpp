@@ -1,15 +1,88 @@
 #ifdef __ANDROID__
 #include "performance_session.h"
+#include "performance_cores.h"
 #include "port_android_performance.h"
 #include <atomic>
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdio.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <string.h>
+#include <string>
 #include <time.h>
 #include <unistd.h>
 
 namespace {
+std::string cpuList(const cpu_set_t& mask) {
+    std::string ids;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &mask)) {
+        if (!ids.empty()) ids += ',';
+        ids += std::to_string(cpu);
+    }
+    return ids.empty() ? "none" : ids;
+}
+uint32_t cpuWeight(int cpu, const char* node) {
+    char path[160];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", cpu, node);
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long value = 0;
+    const bool valid = fscanf(f, "%llu", &value) == 1 && value > 0 && value <= UINT32_MAX;
+    fclose(f);
+    return valid ? uint32_t(value) : 0;
+}
+void configurePerformanceCores() {
+    // This is per native thread and independent of hint-session availability.
+    // Check only once; the launcher starts a fresh process after settings change.
+    static thread_local bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+    const char* enabled = getenv("SMS_ANDROID_PERFORMANCE_CORES");
+    if (!enabled || !*enabled || enabled[0] == '0') {
+        fprintf(stderr, "[android] performance cores: disabled for TID %d\n", gettid());
+        return;
+    }
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) {
+        fprintf(stderr, "[android] performance cores: TID %d cannot read allowed CPUs: %s\n", gettid(), strerror(errno));
+        return;
+    }
+    std::vector<port_android::CpuWeight> weights;
+    const char* ranking = nullptr;
+    // Require complete metadata from one source. Never mix capacity and MHz.
+    for (const char* node : {"cpu_capacity", "cpufreq/cpuinfo_max_freq"}) {
+        weights.clear();
+        bool complete = true;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &allowed)) {
+            const uint32_t weight = cpuWeight(cpu, node);
+            weights.push_back({cpu, weight});
+            if (!weight) complete = false;
+        }
+        if (complete && !weights.empty()) { ranking = node; break; }
+    }
+    const auto selected = ranking ? port_android::performanceCores(weights) : std::vector<int>{};
+    if (selected.empty()) {
+        fprintf(stderr, "[android] performance cores: TID %d unchanged, allowed CPUs %s; "
+                        "no clear multi-core performance tier (%s)\n",
+                gettid(), cpuList(allowed).c_str(), ranking ? ranking : "metadata unavailable");
+        return;
+    }
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    for (const int cpu : selected) CPU_SET(cpu, &requested);
+    if (sched_setaffinity(0, sizeof requested, &requested) != 0) {
+        fprintf(stderr, "[android] performance cores: TID %d request CPUs %s rejected: %s\n",
+                gettid(), cpuList(requested).c_str(), strerror(errno));
+        return;
+    }
+    cpu_set_t effective;
+    const bool verified = sched_getaffinity(0, sizeof effective, &effective) == 0;
+    fprintf(stderr, "[android] performance cores: TID %d, ranking %s, allowed CPUs %s, "
+                    "requested CPUs %s, effective CPUs %s; clocks remain OS-controlled\n",
+            gettid(), ranking, cpuList(allowed).c_str(), cpuList(requested).c_str(),
+            verified ? cpuList(effective).c_str() : "unverified");
+}
 std::atomic<int32_t> renderTid{0};
 port_android::HintSession* hints = nullptr;
 bool initialized = false, unavailable = false, logTiming = false, headroom = false;
@@ -42,7 +115,7 @@ void initialize() {
     const char* logging = getenv("SMS_TIMING_LOG");
     logTiming = logging && *logging && logging[0] != '0';
     const char* reserve = getenv("SMS_ANDROID_PERFORMANCE_HEADROOM");
-    // v9's stronger request regressed on the tester's device. Keep the
+    // The v9 build regressed on the tester's device. Keep the
     // original full-frame target unless the player explicitly opts in.
     headroom = reserve && *reserve && reserve[0] != '0';
     const char* enabled = getenv("SMS_ANDROID_PERFORMANCE_HINTS");
@@ -75,6 +148,7 @@ void initialize() {
 }
 
 extern "C" void port_android_performance_render_thread() {
+    configurePerformanceCores();
     renderTid.store(gettid(), std::memory_order_release);
 }
 extern "C" void port_android_performance_frame_end() {
@@ -110,6 +184,7 @@ extern "C" void port_android_performance_frame_end() {
 }
 extern "C" void port_android_performance_frame_begin(int64_t targetNs) {
     if (targetNs <= 0) { frameStart = 0; return; }
+    configurePerformanceCores();
     if (!initialized) initialize();
     if ((unavailable || !hints) && !logTiming) return;
     const int32_t game = gettid();
