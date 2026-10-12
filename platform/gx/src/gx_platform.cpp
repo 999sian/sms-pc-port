@@ -32,6 +32,9 @@ extern "C" void port_android_performance_shutdown(void) __attribute__((weak));
 
 #ifdef SMS_GX_HAVE_SDL2
 #include <SDL.h>
+#ifdef __ANDROID__
+#include "gx_android_controller_mapping.h"
+#endif
 #ifdef _WIN32
 #include <SDL_syswm.h>
 #endif
@@ -829,6 +832,42 @@ static void noteInputDevice(const SDL_Event& ev) {
 }
 #endif
 
+#ifdef SMS_GX_HAVE_SDL2
+static void openPad(int index) {
+    const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
+    if (id < 0) return;
+    for (SDL_GameController* pad : s_pads)
+        if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)) == id) return;
+    if (SDL_IsGameController(index)) {
+        if (SDL_GameController* pad = SDL_GameControllerOpen(index)) {
+            s_pads.push_back(pad);
+            if (s_rumblePad < 0) s_rumblePad = id;
+        }
+    }
+}
+#ifdef __ANDROID__
+static bool addLegacyAndroidPad(int index) {
+    if (SDL_IsGameController(index)) return false; // Preserve existing/user mappings.
+    const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(index);
+    const Uint16 vendor = SDL_JoystickGetDeviceVendor(index), product = SDL_JoystickGetDeviceProduct(index);
+    if (vendor != 0x0810 || product != 0x0001) return false;
+    SDL_Joystick* raw = SDL_JoystickOpen(index);
+    if (!raw) return false;
+    char mapping[512];
+    const Uint16 buttons = Uint16(guid.data[12] | Uint16(guid.data[13]) << 8);
+    const Uint16 axes = Uint16(guid.data[14] | Uint16(guid.data[15]) << 8);
+    const bool eligible = gx::androidLegacyControllerMapping(guid, vendor, product,
+        SDL_JoystickNumAxes(raw), SDL_JoystickNumButtons(raw), SDL_JoystickNumHats(raw),
+        buttons, axes, false, mapping, sizeof mapping);
+    const bool added = eligible && SDL_GameControllerAddMapping(mapping) >= 0;
+    if (eligible)
+        logmsg("Android legacy controller 0810:0001: %s", added ? mapping : SDL_GetError());
+    SDL_JoystickClose(raw);
+    return added;
+}
+#endif
+#endif
+
 void sms_gx_pump_events(void) {
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode != MODE_WINDOW) return;
@@ -836,13 +875,16 @@ void sms_gx_pump_events(void) {
     while (SDL_PollEvent(&ev)) {
         if (!cheatMenuVisible()) noteInputDevice(ev);
         switch (ev.type) {
+#ifdef __ANDROID__
+        case SDL_JOYDEVICEADDED:
+            // The original joystick-add event has already passed SDL's
+            // controller filter. Adding a mapping does not post another add,
+            // so open this controller now; duplicate opens are guarded.
+            if (addLegacyAndroidPad(ev.jdevice.which)) openPad(ev.jdevice.which);
+            break;
+#endif
         case SDL_CONTROLLERDEVICEADDED:
-            if (SDL_IsGameController(ev.cdevice.which)) {
-                if (SDL_GameController* c = SDL_GameControllerOpen(ev.cdevice.which)) {
-                    s_pads.push_back(c);
-                    if (s_rumblePad < 0) s_rumblePad = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(c));
-                }
-            }
+            openPad(ev.cdevice.which);
             break;
         case SDL_CONTROLLERDEVICEREMOVED:
             for (size_t i = 0; i < s_pads.size(); i++)

@@ -238,3 +238,26 @@ addresses across a 64 MiB arena at preferred and relocated bases, round trips
 through the GPU address format, bounds and the palette command sequence.
 It also checks the unchanged desktop path at its original base. No ROM or
 Android runtime is run. v15 artifacts remain unchanged.
+
+
+Preview 17 adds an SDL mapping fallback for the reported 0810:0001 legacy
+USB Gamepad. Android emits its generic BUTTON_1..12 keys as SDL raw buttons
+20..31, and its hat as D-pad buttons 11..14. SDL's Android auto-mapper rejects
+it because it has no named A/B/X/Y keys; the game only opens mapped controllers.
+The fallback translates the existing SDL Linux PS1 profile for this VID/PID
+into Android's ABI, with four stick axes and digital trigger buttons.
+
+It runs only for an unmapped matching VID/PID with four axes, at least 32 raw
+buttons, no raw hats and the expected Android GUID capability bits. Existing
+mappings and other layouts are preserved. A raw joystick-add event installs
+the profile and opens the controller immediately, because adding a mapping
+alone does not generate another controller-add event. Instance-ID checks avoid
+duplicate opens; existing disconnect and reconnect handling is retained.
+The accepted mapping is logged. Desktop profile selection is unchanged.
+
+Run `bash platform/gx/tests/check_android_controller.sh` for a host test using
+SDL's virtual joystick (no video/Android runtime): exclusions, actual mapping
+recognition, numbered-button/controller events, digital trigger pressure,
+D-pad/sticks/releases, instance IDs and reconnect. Physical layout confirmation
+is still needed, especially shoulder assignments and right-stick orientation.
+The launcher's Input test remains useful for collecting that report.
