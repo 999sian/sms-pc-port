@@ -239,6 +239,23 @@ through the GPU address format, bounds and the palette command sequence.
 It also checks the unchanged desktop path at its original base. No ROM or
 Android runtime is run. v15 artifacts remain unchanged.
 
+Two more retail-address assumptions left the picture black from the title
+onward, with audio still playing, when MEM1 is relocated (an Adreno 650
+device at 0x40800000). `J3DLoadArrayBasePtr` packed vertex-array bases as
+`(u32)ptr & 0x7fffffff`, which is an arena offset only at 0x80000000, so
+every J3D shape read its positions, normals, colors and texture coordinates
+from the wrong place. Android now packs `OSCachedToPhysical(ptr)`. The draw
+sync thread told FIFO pointers from u16 tokens by `msg >= 0x80000000`; a
+relocated pointer fell into the shutdown range, the thread exited, and the
+game thread then blocked sending to its full queue. Android now treats any
+message above the 0x10000 shutdown value as a pointer. Desktop code is
+unchanged in both places.
+
+`bash platform/tests/check_j3d_array_addresses.sh` and
+`bash platform/tests/check_draw_sync_pointers.sh` compile the actual
+J3DTevs and DrawSyncManager code, confirm the old Android code fails at
+relocated bases, then check the patched Android and unchanged desktop code.
+
 
 Preview 17 adds an SDL mapping fallback for the reported 0810:0001 legacy
 USB Gamepad. Android emits its generic BUTTON_1..12 keys as SDL raw buttons
