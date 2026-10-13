@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     assert(SDL_crc16(0,"123456789",9) == 0xbb3d); // Java descriptor CRC contract.
     assert(SDL_crc16(0,"\xc0\x80",2) == 0xa051);
     assert(SDL_crc16(0,"\xed\xa0\xbd\xed\xb8\x80",6) == 0x9d50);
-    SDL_snprintf(record,sizeof record,"0810:0001:%04x\ta:b20,y:none,rightx:a2~,righty:none,lefttrigger:+a0,leftx:none,",crc);
+    SDL_snprintf(record,sizeof record,"0810:0001:%04x\ta:b20,y:none,rightx:a2~,righty:none,lefttrigger:+a0,leftx:none,paddle1:b32,-lefty:b33,+rightx:b34,",crc);
     assert(gx::parseControllerProfile(record,user));
     assert(gx::controllerProfileMatches(user,guid,0x0810,1));
     assert(!gx::controllerProfileMatches(user,guid,0x0810,2));
@@ -115,7 +115,8 @@ int main(int argc, char** argv) {
     assert(!gx::controllerProfileMatches(user,other,0x0810,1));
     gx::AndroidControllerProfile bad;
     for (const char* invalid : {"0810:0001:0000\t", "0810:0001:0000\tcrc:abcd,", "0810:0001:0000\ta:b36,",
-        "0810:0001:0000\ta:b1,a:b2,", "0810:0001:0000\trightx:a9999,", "0810:0001:0000\ta:b1~,"})
+        "0810:0001:0000\ta:b1,a:b2,", "0810:0001:0000\trightx:a9999,", "0810:0001:0000\ta:b1~,",
+        "0810:0001:0000\t+a:b1,", "0810:0001:0000\tpaddle3:b1,", "0810:0001:0000\t+leftx:b1,+leftx:b2,"})
         assert(!gx::parseControllerProfile(invalid,bad));
     assert(gx::controllerHidIgnore({user,user},"0x1234/0x0002") == "0x1234/0x0002,0x0810/0x0001");
     gx::AndroidControllerProfile unidentified=user;unidentified.product=0;
@@ -153,6 +154,27 @@ int main(int argc, char** argv) {
     assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_LEFTX) == 0);
     assert(SDL_JoystickSetVirtualAxis(raw,0,0) == 0); SDL_JoystickUpdate();
     assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_TRIGGERLEFT) == 0);
+    // A soft-press carrier and buttons pushing one stick direction, alongside
+    // the stick axes they share.
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+    assert(SDL_JoystickSetVirtualButton(raw,32,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_PADDLE1) == 1);
+    assert(mappedEvent(SDL_CONTROLLERBUTTONDOWN,id,SDL_CONTROLLER_BUTTON_PADDLE1,1));
+    assert(SDL_JoystickSetVirtualButton(raw,32,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_PADDLE1) == 0);
+    assert(SDL_JoystickSetVirtualButton(raw,33,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_LEFTY) == -32768);
+    assert(mappedEvent(SDL_CONTROLLERAXISMOTION,id,SDL_CONTROLLER_AXIS_LEFTY,-32768));
+    assert(SDL_JoystickSetVirtualButton(raw,33,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_LEFTY) == 0);
+    assert(SDL_JoystickSetVirtualAxis(raw,1,32767) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_LEFTY) == 32767); // untouched stick axis
+    assert(SDL_JoystickSetVirtualAxis(raw,1,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_JoystickSetVirtualButton(raw,34,1) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX) == 32767);
+    assert(SDL_JoystickSetVirtualButton(raw,34,0) == 0); SDL_JoystickUpdate();
+    assert(mappedEvent(SDL_CONTROLLERAXISMOTION,id,SDL_CONTROLLER_AXIS_RIGHTX,0));
+    assert(SDL_abs(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX)) <= 1); // inverted a2 at rest
     SDL_GameControllerClose(pad); SDL_JoystickClose(raw);
     assert(SDL_JoystickDetachVirtual(index) == 0);
     // Mapping persists across a disconnect; a newly attached matching device
@@ -163,5 +185,5 @@ int main(int argc, char** argv) {
     assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_A) == 0);
     SDL_GameControllerClose(pad); assert(SDL_JoystickDetachVirtual(index) == 0);
     SDL_Quit();
-    std::puts("PASS Android controller mapping: legacy input, saved overrides, clears, untouched defaults, device identity, malformed profiles, inversion, triggers, events and reconnect");
+    std::puts("PASS Android controller mapping: legacy input, saved overrides, clears, untouched defaults, soft-press carriers, stick directions, device identity, malformed profiles, inversion, triggers, events and reconnect");
 }

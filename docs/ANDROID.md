@@ -287,3 +287,10 @@ clear semantics, preserved defaults, events, inverted camera and half-axis
 trigger calibration. Existing graphics checks and Android builds are separate.
 No Android container/emulator is run. Configuration UI/capture/persistence and
 physical gameplay application need tester validation; no FPS change is claimed.
+
+Profiles may also bind `paddle1`/`paddle2` and single stick directions
+(`-leftx`, `+lefty`, `-rightx` and so on). The launcher uses the paddles to
+carry soft L and R presses, and binds them to `L_SOFT`/`R_SOFT` through the
+`SMS_BINDINGS` file it passes on Play; a stick direction lets a button push
+the stick fully that way while the stick's own axis keeps working. The SDL
+virtual-controller check covers both.

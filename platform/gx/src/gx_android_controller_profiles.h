@@ -14,8 +14,11 @@ struct AndroidControllerProfile {
     std::map<std::string,std::string> overrides;
 };
 inline bool controllerTarget(const std::string& name) {
+    // paddle1/paddle2 carry the launcher's soft L/R presses (its bindings file
+    // gives them to L_SOFT/R_SOFT); signed stick names are one direction.
     static const char* names[] = {"a","b","x","y","rightshoulder","lefttrigger","righttrigger","start",
-        "leftx","lefty","rightx","righty","dpup","dpdown","dpleft","dpright"};
+        "leftx","lefty","rightx","righty","dpup","dpdown","dpleft","dpright","paddle1","paddle2",
+        "-leftx","+leftx","-lefty","+lefty","-rightx","+rightx","-righty","+righty"};
     for (const char* value : names) if (name == value) return true;
     return false;
 }
