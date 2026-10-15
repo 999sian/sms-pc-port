@@ -10,6 +10,7 @@ bool desktopEntry(const char* name);
 std::string shaderSource(const std::string& source, unsigned type);
 bool metricActive();
 bool needsRebasedIndices();
+void memoryBarrier(unsigned bits);
 // Rebase an entire range once when GLES lacks base-vertex draws. Keep the
 // temporary element buffer bound for its ordered colour/depth/metric passes.
 struct IndexRange {

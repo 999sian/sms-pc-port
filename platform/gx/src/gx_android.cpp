@@ -1,5 +1,5 @@
 // GLES adapters for desktop-only GL entry points used by the GX backend.
-// Logic operations use an RGBA8 destination snapshot per primitive. Exact
+// Logic operations use an RGBA8 destination snapshot per draw. Exact
 // numeric pixel metrics use a shader storage counter rather than GLES's
 // boolean occlusion queries, which cannot represent the game's counters.
 #include "gl_funcs.h"
@@ -28,7 +28,9 @@ PFNGLGETQUERYOBJECTUIVPROC queryResult;
 PFNGLDELETEQUERIESPROC deleteQueries;
 PFNGLSAMPLERPARAMETERFPROC samplerParameter;
 PFNGLBINDSAMPLERPROC bindSampler;
+PFNGLCOLORMASKPROC colorMask;
 bool clipDistance, depthClamp, logicEnabled, metricOn;
+bool colourWrites = true;  // any of glColorMask's four
 GLenum logic = GL_COPY;
 GLuint program, logicTexture;
 GLuint rebasedIndices;
@@ -122,6 +124,10 @@ void integerAdapter(GLenum name, GLint* out) {
 }
 void programAdapter(GLuint p) { useProgram(p); program = p; uniforms(); }
 void logicAdapter(GLenum op) { logic = op; uniforms(); }
+void colorMaskAdapter(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    colourWrites = r || g || b || a;
+    colorMask(r, g, b, a);
+}
 void pointAdapter(GLfloat size) { pointSize = size; uniforms(); }
 void clearDepthAdapter(GLdouble depth) { entry<PFNGLCLEARDEPTHFPROC>("glClearDepthf")(GLfloat(depth)); }
 void depthRangeAdapter(GLdouble lo, GLdouble hi) { entry<PFNGLDEPTHRANGEFPROC>("glDepthRangef")(GLfloat(lo), GLfloat(hi)); }
@@ -169,20 +175,25 @@ void snapshotDestination() {
     entry<PFNGLCOPYTEXSUBIMAGE2DPROC>("glCopyTexSubImage2D")(GL_TEXTURE_2D, 0, 0, 0, 0, 0, textureW, textureH);
     glActiveTexture(GLenum(active));
 }
+// Whether a draw needs the destination snapshot: a logic operation that reads
+// the destination, on a draw that writes colour. Mario's electric shock
+// (an Electrokoopa's, say) draws his body twice with XOR and colour writes
+// off, for depth, then twice with them on.
+bool needsDestination() {
+    return logicEnabled && colourWrites && logic != GL_COPY && logic != GL_CLEAR && logic != GL_SET &&
+           logic != GL_COPY_INVERTED;
+}
+// One snapshot per draw, not per primitive: primitives of one draw that
+// overlap each other see the destination from before the draw. A snapshot per
+// triangle copied the whole 2x EFB a few thousand times a frame for the
+// shock, which held a Snapdragon 8 Gen 3 at about 1 FPS while it lasted.
 void drawAdapter(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint base) {
-    if (!logicEnabled || logic == GL_COPY || logic == GL_CLEAR || logic == GL_SET || logic == GL_COPY_INVERTED) {
-        drawBase(mode, count, type, indices, base);
-        return;
-    }
-    const GLsizei step = mode == GL_TRIANGLES ? 3 : mode == GL_LINES ? 2 : 1;
-    const size_t bytes = type == GL_UNSIGNED_INT ? 4 : type == GL_UNSIGNED_SHORT ? 2 : 1;
-    for (GLsizei i = 0; i < count; i += step) {
-        snapshotDestination();
-        drawBase(mode, step, type, reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(indices) + size_t(i) * bytes), base);
-    }
+    if (needsDestination()) snapshotDestination();
+    drawBase(mode, count, type, indices, base);
 }
 void multiDrawAdapter(GLenum mode, const GLsizei* counts, GLenum type, const void* const* indices, GLsizei n, const GLint* bases) {
-    for (GLsizei i = 0; i < n; ++i) drawAdapter(mode, counts[i], type, indices[i], bases[i]);
+    if (needsDestination()) snapshotDestination();
+    for (GLsizei i = 0; i < n; ++i) drawBase(mode, counts[i], type, indices[i], bases[i]);
 }
 
 void beginAdapter(GLenum target, GLuint q) {
@@ -223,6 +234,7 @@ void replace(std::string& s, const std::string& from, const std::string& to) {
 }
 
 bool metricActive() { return metricOn; }
+void memoryBarrier(unsigned bits) { entry<PFNGLMEMORYBARRIERPROC>("glMemoryBarrier")(GLbitfield(bits)); }
 bool needsRebasedIndices() { return drawBase == rebaseDraw; }
 IndexRange::IndexRange(size_t sourceOffset, int count, int sourceBase, unsigned buffer, const uint32_t* src)
     : offset(sourceOffset), base(sourceBase) {
@@ -254,6 +266,7 @@ void install(void* (*getProc)(const char*)) {
     useProgram = glUseProgram; drawBase = glDrawElementsBaseVertex;
     deleteProgram = glDeleteProgram; linkProgram = glLinkProgram; programBinary = glProgramBinary;
     samplerParameter = glSamplerParameterf; bindSampler = glBindSampler;
+    colorMask = glColorMask;
     GLint major = 0, minor = 0;
     getInteger(GL_MAJOR_VERSION, &major); getInteger(GL_MINOR_VERSION, &minor);
     if (has("GL_OES_draw_elements_base_vertex")) drawBase = entry<PFNGLDRAWELEMENTSBASEVERTEXPROC>("glDrawElementsBaseVertexOES");
@@ -271,6 +284,7 @@ void install(void* (*getProc)(const char*)) {
     if (programBinary) gx::gl::gx_glProgramBinary = programBinaryAdapter;
     gx::gl::gx_glSamplerParameterf = samplerAdapter; gx::gl::gx_glBindSampler = bindSamplerAdapter;
     gx::gl::gx_glLogicOp = logicAdapter; gx::gl::gx_glPointSize = pointAdapter;
+    gx::gl::gx_glColorMask = colorMaskAdapter;
     gx::gl::gx_glClearDepth = clearDepthAdapter; gx::gl::gx_glDepthRange = depthRangeAdapter;
     gx::gl::gx_glBindFragDataLocation = fragLocationAdapter;
     gx::gl::gx_glMultiDrawElementsBaseVertex = multiDrawAdapter;

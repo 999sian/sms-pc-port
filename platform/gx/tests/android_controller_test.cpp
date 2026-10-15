@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
     assert(SDL_IsGameController(index));
     SDL_GameController* pad = SDL_GameControllerOpen(index); assert(pad);
     const SDL_JoystickID id = SDL_JoystickInstanceID(raw);
+    char* legacyText = SDL_GameControllerMapping(pad); assert(legacyText);
+    const std::string legacy = legacyText; SDL_free(legacyText); // rightx:a3, righty:a2
     SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
     const SDL_GameControllerButton face[] = {SDL_CONTROLLER_BUTTON_Y,SDL_CONTROLLER_BUTTON_B,
         SDL_CONTROLLER_BUTTON_A,SDL_CONTROLLER_BUTTON_X};
@@ -175,6 +177,71 @@ int main(int argc, char** argv) {
     assert(SDL_JoystickSetVirtualButton(raw,34,0) == 0); SDL_JoystickUpdate();
     assert(mappedEvent(SDL_CONTROLLERAXISMOTION,id,SDL_CONTROLLER_AXIS_RIGHTX,0));
     assert(SDL_abs(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX)) <= 1); // inverted a2 at rest
+    // A stick direction moved to an axis replaces that direction of the
+    // stick's automatic whole-axis binding, which SDL would otherwise match
+    // first; directions the player left alone keep the automatic binding.
+    auto configure = [&](const char* entries) {
+        char line[256]; gx::AndroidControllerProfile directions; std::string text;
+        SDL_snprintf(line,sizeof line,"0810:0001:%04x\t%s",crc,entries);
+        assert(gx::parseControllerProfile(line,directions));
+        assert(gx::userControllerMapping(guid,directions,4,36,legacy.c_str(),text));
+        assert(text.find(",:") == std::string::npos && text.find(",,") == std::string::npos);
+        for (int axis = 0; axis < 4; ++axis) assert(SDL_JoystickSetVirtualAxis(raw,axis,0) == 0);
+        SDL_JoystickUpdate();
+        assert(SDL_GameControllerAddMapping(text.c_str()) >= 0);
+        return text;
+    };
+    // The game reads controller events: SDL gives a raw axis value to the
+    // first binding whose input range holds it. Returns the output's event
+    // value (0 if none), checked against the polled value, and checks that
+    // `unmoved` sent nothing.
+    auto moved = [&](int axis, Sint16 value, SDL_GameControllerAxis output,
+                     SDL_GameControllerAxis unmoved = SDL_CONTROLLER_AXIS_INVALID) {
+        SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+        assert(SDL_JoystickSetVirtualAxis(raw,axis,value) == 0); SDL_JoystickUpdate();
+        int sent = 0; SDL_Event e;
+        while (SDL_PollEvent(&e)) if (e.type == SDL_CONTROLLERAXISMOTION && e.caxis.which == id) {
+            if (e.caxis.axis == output) sent = e.caxis.value;
+            assert(e.caxis.axis != unmoved || e.caxis.value == 0);
+        }
+        assert(unmoved != SDL_CONTROLLER_AXIS_INVALID || SDL_GameControllerGetAxis(pad,output) == sent);
+        assert(SDL_JoystickSetVirtualAxis(raw,axis,0) == 0); SDL_JoystickUpdate();
+        return sent;
+    };
+    // Both camera directions swapped through the Left and Right rows.
+    std::string swapped = configure("-rightx:+a3,+rightx:-a3,");
+    assert(swapped.find(",rightx:a3,") == std::string::npos);
+    assert(moved(3,32767,SDL_CONTROLLER_AXIS_RIGHTX) == -32768);
+    assert(moved(3,-32768,SDL_CONTROLLER_AXIS_RIGHTX) == 32767);
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+    assert(SDL_JoystickSetVirtualAxis(raw,3,32767) == 0); SDL_JoystickUpdate();
+    assert(mappedEvent(SDL_CONTROLLERAXISMOTION,id,SDL_CONTROLLER_AXIS_RIGHTX,-32768));
+    assert(SDL_JoystickSetVirtualAxis(raw,3,0) == 0); SDL_JoystickUpdate();
+    assert(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_RIGHTX) == 0);
+    assert(moved(2,32767,SDL_CONTROLLER_AXIS_RIGHTY) == 32767); // other axes untouched
+    assert(moved(0,-32768,SDL_CONTROLLER_AXIS_LEFTX) == -32768);
+    // One row: Left is now the stick's right; Right keeps the automatic
+    // binding, so the stick's left (now unbound) does nothing.
+    std::string one = configure("-rightx:+a3,");
+    assert(one.find("+rightx:+a3,") != std::string::npos && one.find(",rightx:a3,") == std::string::npos);
+    assert(moved(3,32767,SDL_CONTROLLER_AXIS_RIGHTX) == -32768);
+    assert(moved(3,-32768,SDL_CONTROLLER_AXIS_RIGHTX) == 0);
+    // An inverted whole-axis row split around a cleared direction.
+    configure("rightx:a3~,-rightx:none,");
+    assert(moved(3,32767,SDL_CONTROLLER_AXIS_RIGHTX) == 0);
+    assert(moved(3,-32768,SDL_CONTROLLER_AXIS_RIGHTX) == 32767);
+    // The player's direction wins over another automatic binding of the same
+    // raw axis half; that binding keeps the other half.
+    configure("+rightx:+a0,");
+    // (Polling LEFTX would still read a0 through leftx:a0; the game doesn't poll.)
+    assert(moved(0,32767,SDL_CONTROLLER_AXIS_RIGHTX,SDL_CONTROLLER_AXIS_LEFTX) == 32767);
+    assert(moved(0,-32768,SDL_CONTROLLER_AXIS_LEFTX) == -32768);
+    assert(moved(3,32767,SDL_CONTROLLER_AXIS_RIGHTX) == 0);
+    assert(moved(3,-32768,SDL_CONTROLLER_AXIS_RIGHTX) == -32768);
+    // A whole inverted row alone is unchanged.
+    configure("rightx:a3~,");
+    assert(moved(3,32767,SDL_CONTROLLER_AXIS_RIGHTX) == -32768);
+    assert(moved(3,-32768,SDL_CONTROLLER_AXIS_RIGHTX) == 32767);
     SDL_GameControllerClose(pad); SDL_JoystickClose(raw);
     assert(SDL_JoystickDetachVirtual(index) == 0);
     // Mapping persists across a disconnect; a newly attached matching device
@@ -185,5 +252,5 @@ int main(int argc, char** argv) {
     assert(SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_A) == 0);
     SDL_GameControllerClose(pad); assert(SDL_JoystickDetachVirtual(index) == 0);
     SDL_Quit();
-    std::puts("PASS Android controller mapping: legacy input, saved overrides, clears, untouched defaults, soft-press carriers, stick directions, device identity, malformed profiles, inversion, triggers, events and reconnect");
+    std::puts("PASS Android controller mapping: legacy input, saved overrides, clears, untouched defaults, soft-press carriers, stick directions, direction rows over automatic stick axes, device identity, malformed profiles, inversion, triggers, events and reconnect");
 }
