@@ -311,3 +311,15 @@ carry soft L and R presses, and binds them to `L_SOFT`/`R_SOFT` through the
 `SMS_BINDINGS` file it passes on Play; a stick direction lets a button push
 the stick fully that way while the stick's own axis keeps working. The SDL
 virtual-controller check covers both.
+
+A stick direction can also be given a stick axis (`-rightx:+a2` makes pushing
+the stick right turn the camera left). SDL hands a raw axis value to the first
+binding whose input range holds it, so the player's entries now come first in
+the mapping, and a direction given an axis (or `none`) takes that direction
+away from the stick's whole-axis binding: `rightx:a2` with `-rightx:+a2`
+becomes `-rightx:+a2,+rightx:+a2`, and `a2~` swaps which half feeds which
+direction. A direction given a button still only adds the button. Before
+this, a direction row given a stick axis was appended after the automatic
+`rightx:a2`, which always matched first, so the row did nothing. The host
+check covers swapped and single direction rows, an inverted row split around
+a cleared direction, and a direction taken from another stick's axis.

@@ -81,11 +81,39 @@ inline std::string controllerHidIgnore(const std::vector<AndroidControllerProfil
     }
     return result;
 }
+// True when the player moved one stick direction (+X/-X) to an axis or
+// cleared it, so the stick's own binding no longer drives that direction. A
+// direction given to a button only adds that button.
+inline bool stickDirectionReplaced(const AndroidControllerProfile& profile, const std::string& key) {
+    const auto found = profile.overrides.find(key);
+    if (found == profile.overrides.end()) return false;
+    const std::string& value = found->second;
+    return value == "none" || value[value[0] == '+' || value[0] == '-'] == 'a';
+}
+// Appends one binding. A whole stick axis bound to a whole raw axis (aN or
+// aN~) keeps only the directions the player did not replace, as half-axis
+// bindings: SDL gives a raw axis value to the first binding whose input range
+// holds it, so a whole-axis binding would also hide the player's direction.
+inline void appendControllerBinding(const AndroidControllerProfile& profile, const std::string& key,
+        const std::string& value, std::string& result) {
+    const bool stick = key == "leftx" || key == "lefty" || key == "rightx" || key == "righty";
+    const bool plus = stick && stickDirectionReplaced(profile, "+" + key);
+    const bool minus = stick && stickDirectionReplaced(profile, "-" + key);
+    if ((!plus && !minus) || value.empty() || value[0] != 'a') { result += key + ':' + value + ','; return; }
+    const bool inverted = value.back() == '~';
+    const std::string axis = value.substr(0, value.size() - inverted);
+    if (!plus) result += "+" + key + ':' + (inverted ? "-" : "+") + axis + ',';
+    if (!minus) result += "-" + key + ':' + (inverted ? "+" : "-") + axis + ',';
+}
 inline bool userControllerMapping(SDL_JoystickGUID guid, const AndroidControllerProfile& profile, int axes, int buttons,
         const char* base, std::string& result) {
     for (const auto& entry : profile.overrides) if (!controllerExpression(entry.second,axes,buttons)) return false;
     char id[33]; SDL_JoystickGetGUIDString(guid,id,sizeof id);
     result = std::string(id) + ",Configured controller,";
+    // The player's rows come first: SDL uses the first binding for a raw
+    // button or axis range, so they win over automatic ones sharing an input.
+    for (const auto& entry : profile.overrides)
+        if (entry.second != "none") appendControllerBinding(profile, entry.first, entry.second, result);
     // Preserve automatic bindings/metadata except the explicitly edited rows.
     const char* body = base ? std::strchr(base, ',') : nullptr;
     if (body) body = std::strchr(body+1, ',');
@@ -94,11 +122,12 @@ inline bool userControllerMapping(SDL_JoystickGUID guid, const AndroidController
         while (at < text.size()) {
             size_t next = text.find(',',at); if (next == std::string::npos) next = text.size();
             std::string entry = text.substr(at,next-at); const size_t colon = entry.find(':');
-            if (!entry.empty() && (colon == std::string::npos || !profile.overrides.count(entry.substr(0,colon)))) result += entry + ',';
+            if (colon == std::string::npos) { if (!entry.empty()) result += entry + ','; }
+            else if (!profile.overrides.count(entry.substr(0,colon)))
+                appendControllerBinding(profile, entry.substr(0,colon), entry.substr(colon+1), result);
             at = next + 1;
         }
     }
-    for (const auto& entry : profile.overrides) if (entry.second != "none") result += entry.first + ':' + entry.second + ',';
     return true;
 }
 } // namespace gx
