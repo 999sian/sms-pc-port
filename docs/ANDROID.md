@@ -34,7 +34,7 @@ Android shader adapters cache uniform locations and retained values, with
 invalidation on program deletion, linking and binary loading. Shader generation
 uses GLSL ES, with explicit fragment locations and precision. Desktop-only
 depth-range/clear-depth, point-size and multi-draw calls have GLES adapters.
-Color logic operations use a destination snapshot per primitive. Numeric
+Color logic operations use a destination snapshot per draw that writes colour. Numeric
 pixel metrics use SSBO counters and ordered drawing, preserving counts that
 GLES boolean visibility queries cannot provide. MSAA stays off on Android.
 Clip distances and depth clamp use their GLES extensions when available.

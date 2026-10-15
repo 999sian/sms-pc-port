@@ -671,6 +671,27 @@ int main(int argc, char** argv) {
         GXSetColorUpdate(GX_TRUE);
     }
 
+    // Logic operations. Mario's electric shock draws his body with XOR, first
+    // with colour writes off (for depth), then on. A draw with colour off
+    // leaves colour alone; each later XOR draw sees the one before it.
+    {
+        colorSetup();
+        setOrtho();
+        GXSetColorUpdate(GX_TRUE);
+        GXSetAlphaUpdate(GX_FALSE);
+        colorQuad(500, 100, 580, 180, 0x30, 0x60, 0x90, 255);
+        GXSetBlendMode(GX_BM_LOGIC, GX_BL_ONE, GX_BL_ZERO, GX_LO_XOR);
+        GXSetColorUpdate(GX_FALSE);
+        colorQuad(500, 100, 580, 180, 0xFF, 0xFF, 0xFF, 255);
+        expectPixel("logic XOR with colour writes off", 540, 140, 0x30, 0x60, 0x90, 0);
+        GXSetColorUpdate(GX_TRUE);
+        colorQuad(500, 100, 580, 180, 0xFF, 0xFF, 0xFF, 255);
+        expectPixel("logic XOR", 540, 140, 0xCF, 0x9F, 0x6F, 0);
+        colorQuad(520, 120, 560, 160, 0x0F, 0xF0, 0x00, 255);
+        expectPixel("logic XOR over an earlier XOR draw", 540, 140, 0xC0, 0x6F, 0x6F, 0);
+        GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    }
+
     // The performance overlay must reuse its texture between text updates,
     // update matching storage in place, and leave game rendering intact.
     {
