@@ -226,12 +226,19 @@ void textureCpuWrote(const void* p, uint32_t size);
 uint32_t copyLayout(uint32_t copyFmt, bool z);
 uint32_t encodeTexture(const uint8_t* rgba, uint32_t fmt, uint32_t w, uint32_t h, uint8_t* dst);
 uint32_t texLevelBytes(uint32_t fmt, uint32_t w, uint32_t h);
+void decodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h, const uint8_t* tlut, uint32_t tlutFmt,
+                   uint8_t* out);
 // Texture packs (gx_hires.cpp)
 bool hiresEnabled();
 bool hiresLog();
 std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped, const uint8_t* tlut,
                       uint32_t tlutBytes, bool onlyIfPresent);
 unsigned hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale);
+// The share of a decoded level's texels (RGBA8) at or above alpha 128.
+float alphaCoverage(const uint8_t* rgba, size_t texels);
+// Before a replacement is asked for: alphaCoverage of each of its original's
+// levels, level 0 first, which the levels made for it follow (completeChain).
+void hiresNoteOriginal(const std::string& name, std::vector<float> coverage);
 void hiresShutdown();
 const char* hiresDumpDir();  // SMS_TEXTURE_DUMP, or null
 void hiresDump(const std::string& name, const uint8_t* rgba, uint32_t w, uint32_t h);
