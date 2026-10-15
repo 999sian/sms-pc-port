@@ -6,6 +6,8 @@
 // GXPC_Init itself, and every GXCopyDisp presents the XFB to the window.
 #include "gx_internal.h"
 #include "gx_cheat_menu.h"
+#include "gx_warp_menu.h"
+#include "gx_savestate_overlay.h"
 #include "gx_glthread.h"
 #include "gx_window_layout.h"
 #include "sms_gx/gx_pc.h"
@@ -38,12 +40,17 @@ extern "C" void port_android_performance_shutdown(void) __attribute__((weak));
 #endif
 #ifdef _WIN32
 #include <SDL_syswm.h>
+#include "gx_borderless_window.h"
 #endif
 #endif
 #ifdef SMS_GX_HAVE_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #endif
+
+// USB ids of the GameCube adapters the PAD layer reads itself, which SDL must
+// leave alone (platform/pad/gc_adapter.cpp); none without it.
+extern "C" __attribute__((weak)) const char* port_gc_adapter_sdl_ignore(void) { return nullptr; }
 
 namespace gx {
 extern void (*g_displayCopyHook)(const void* xfb);
@@ -125,6 +132,9 @@ void captureMouse(bool on) {
 // desktop's mode). F11 or Alt+Enter toggles between the window and that
 // fullscreen (desktop when SMS_FULLSCREEN is unset).
 bool s_exclusive = false, s_isFullscreen = false;
+#ifdef _WIN32
+BorderlessWindow s_borderless;
+#endif
 
 #ifdef _WIN32
 // Whether Windows HDR ("advanced colour") is on for the monitor showing the
@@ -169,7 +179,14 @@ bool windowsHdrOn() { return false; }
 // first, so the display returns to the desktop's mode before the process ends
 // rather than Windows restoring it after.
 void leaveFullscreenAtExit() {
-    if (s_window && s_isFullscreen) SDL_SetWindowFullscreen(s_window, 0);
+    if (!s_window || !s_isFullscreen) return;
+#ifdef _WIN32
+    if (s_borderless.active) {
+        s_borderless.leave(s_window);
+        return;
+    }
+#endif
+    SDL_SetWindowFullscreen(s_window, 0);
 }
 
 void setFullscreen(bool on) {
@@ -198,6 +215,18 @@ void setFullscreen(bool on) {
     } else if (on) {
         flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
+#ifdef _WIN32
+    // Borderless and the HDR fallback never enter SDL fullscreen on Windows.
+    // Remember the decorated window so F11/Alt+Enter restores its size and position.
+    if (flags == SDL_WINDOW_FULLSCREEN_DESKTOP) {
+        if (!s_borderless.enter(s_window)) {
+            logmsg("borderless change failed: %s; continuing as before", SDL_GetError());
+            return;
+        }
+    } else if (s_borderless.active && !on) {
+        s_borderless.leave(s_window);
+    } else
+#endif
     if (SDL_SetWindowFullscreen(s_window, flags) != 0) {
         logmsg("fullscreen change failed: %s; continuing as before", SDL_GetError());
         return;
@@ -206,12 +235,23 @@ void setFullscreen(bool on) {
     SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
 }
 
-// The open cheat menu has a free cursor; closing it gives mouse look back the
-// capture it had.
+// An open menu (cheats or warps) has a free cursor; closing it gives mouse
+// look back the capture it had.
 bool s_menuOpen = false, s_capturedBeforeMenu = false;
 
-void syncCheatMenuInput() {
-    const bool open = cheatMenuVisible();
+bool menuVisible() { return cheatMenuVisible() || warpMenuVisible(); }
+// Fullscreen (borderless or exclusive) hides the cursor. When F10 releases
+// mouse look the cursor must come back, or the release looks like it did
+// nothing; capturing it again hides it as before.
+void showReleasedCursor() {
+    SDL_ShowCursor(s_mouseReleased || !s_isFullscreen ? SDL_ENABLE : SDL_DISABLE);
+}
+// F8 and the Back button ([0] and [1]) went down to open or close the warp
+// menu: their release is the menu's too.
+bool s_warpToggleHeld[2];
+
+void syncMenuInput() {
+    const bool open = menuVisible();
     if (open == s_menuOpen) return;
     s_menuOpen = open;
     if (open) {
@@ -272,11 +312,20 @@ bool openWindow(float scale) {
 #endif
     s_windowFailure = WF_NONE;
     s_videoDriver[0] = 0;
-    // Native GameCube adapters (Nintendo / Mayflash in Wii U mode, 057e:0337):
-    // SDL's HIDAPI driver turns each plugged port into a mapped game controller.
-    // Set before SDL_Init; an SDL_JOYSTICK_HIDAPI_GAMECUBE environment value wins.
+    // GameCube adapters: SDL's HIDAPI driver turns each plugged port into a
+    // mapped game controller (EVORETRO and other PC-mode adapters). Set before
+    // SDL_Init; an SDL_JOYSTICK_HIDAPI_GAMECUBE environment value wins.
     SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_GAMECUBE", "1");
+    // Wii U-mode adapters (057e:0337) are the PAD layer's own
+    // (platform/pad/gc_adapter.cpp): SDL leaves them alone, so they are not read
+    // twice or taken from under it. Added to any SDL_HIDAPI_IGNORE_DEVICES set.
+    if (const char* ids = port_gc_adapter_sdl_ignore()) {
+        const char* had = getenv("SDL_HIDAPI_IGNORE_DEVICES");
+        char list[512];
+        snprintf(list, sizeof list, "%s%s%s", had && *had ? had : "", had && *had ? "," : "", ids);
+        SDL_SetHintWithPriority("SDL_HIDAPI_IGNORE_DEVICES", list, SDL_HINT_OVERRIDE);
+    }
     SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
 #ifdef __ANDROID__
     // Captured settings use Android's key/axis numbering, so configured
@@ -417,7 +466,8 @@ bool openWindow(float scale) {
     // the same monitor. Desktop fullscreen keeps the display's native mode;
     // rendering quality and aspect ratio are still handled by the renderer.
     // Exclusive fullscreen switches the display to the mode asked for.
-    if (const char* e = getenv("SMS_FULLSCREEN")) s_exclusive = strcmp(e, "exclusive") == 0;
+    const char* fullscreen = getenv("SMS_FULLSCREEN");
+    s_exclusive = fullscreen && strcmp(fullscreen, "exclusive") == 0;
     if (windowsHdrOn()) logmsg("Windows HDR is on for this monitor");
     if (envTrue("SMS_FULLSCREEN")) setFullscreen(true);
 #ifdef _WIN32
@@ -429,9 +479,10 @@ bool openWindow(float scale) {
 #else
     hdrInit(nullptr);
 #endif
-    if (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN)
+    if (s_isFullscreen)
         logmsg("%s fullscreen on display %d (%s), internal resolution scale %g, OpenGL context ready",
-               (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP ? "desktop" : "exclusive",
+               (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN) &&
+               (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != SDL_WINDOW_FULLSCREEN_DESKTOP ? "exclusive" : "desktop",
                display, s_videoDriver, scale);
     else
         logmsg("window %dx%d centered on display %d (%s), internal resolution scale %g, OpenGL context ready",
@@ -681,7 +732,7 @@ int GXPC_MouseCaptured(void) {
     return 0;
 #endif
 }
-int GXPC_GameInputBlocked(void) { return cheatMenuVisible(); }
+int GXPC_GameInputBlocked(void) { return menuVisible(); }
 int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW; }
 uint32_t GXPC_FrameCount(void) { return s_frame; }
 
@@ -752,6 +803,9 @@ void GXPC_Present(const void* xfb) {
             GXPC_PresentXFB(xfb, w, h);
             GXPC_OverlayDraw(w, h);
             cheatMenuRender(w, h);
+            warpMenuRender(w, h);
+            savestateOverlayRender(w, h);
+            captureWindow(s_frame, w, h);
             t1 = nowSeconds();
 #ifdef __ANDROID__
             // Diagnostic only: separate unfinished GPU work from buffer
@@ -904,7 +958,7 @@ void sms_gx_pump_events(void) {
     if (s_mode != MODE_WINDOW) return;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (!cheatMenuVisible()) noteInputDevice(ev);
+        if (!menuVisible()) noteInputDevice(ev);
         switch (ev.type) {
 #ifdef __ANDROID__
         case SDL_JOYDEVICEADDED:
@@ -943,24 +997,50 @@ void sms_gx_pump_events(void) {
         // F9 opens and closes the cheat menu and is kept from the pad layer
         if ((ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) && ev.key.keysym.scancode == SDL_SCANCODE_F9) {
             if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
+                if (warpMenuVisible()) warpMenuToggle();
                 cheatMenuToggle();
-                syncCheatMenuInput();
+                syncMenuInput();
             }
             continue;
         }
-        if (s_mouseCamera && !cheatMenuVisible()) {
+        // F8 or a controller's Back (Select) button opens the warp menu while
+        // the debug overlay is open, and closes it; a press that does either
+        // is kept from the pad layer, release included. Otherwise they reach
+        // the pad layer as any key or button does (PAD_BACK can be bound).
+        const bool warpKey = (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) && ev.key.keysym.scancode == SDL_SCANCODE_F8;
+        const bool warpButton = (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) &&
+                                ev.cbutton.button == SDL_CONTROLLER_BUTTON_BACK;
+        if (warpKey || warpButton) {
+            bool& held = s_warpToggleHeld[warpButton];
+            const bool down = ev.type == SDL_KEYDOWN || ev.type == SDL_CONTROLLERBUTTONDOWN;
+            const bool repeat = warpKey && ev.key.repeat;
+            if (down && !repeat && (warpMenuVisible() || GXPC_OverlayVisible())) {
+                if (cheatMenuVisible()) cheatMenuToggle();
+                warpMenuToggle();
+                syncMenuInput();
+                held = true;
+                continue;
+            }
+            if (held) {
+                if (!down) held = false;
+                continue;
+            }
+        }
+        if (s_mouseCamera && !menuVisible()) {
             if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) captureMouse(false);
             if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED && !s_mouseReleased)
                 captureMouse(true);
             if (ev.type == SDL_MOUSEBUTTONDOWN && !s_mouseCaptured) {
                 s_mouseReleased = false;
                 captureMouse(true);
+                showReleasedCursor();
                 continue;
             }
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.scancode == SDL_SCANCODE_F10) {
                 if (!ev.key.repeat) {
                     s_mouseReleased = s_mouseCaptured;
                     captureMouse(!s_mouseCaptured);
+                    showReleasedCursor();
                 }
                 continue;
             }
@@ -978,9 +1058,9 @@ void sms_gx_pump_events(void) {
             if (!ev.key.repeat) GXPC_CycleSpeed();
             continue;
         }
-        // The cheat menu's own keys and clicks never reach the pad layer (Escape would quit)
-        if (cheatMenuHandleEvent(ev)) {
-            syncCheatMenuInput();
+        // The menus' own keys, buttons and clicks never reach the pad layer (Escape would quit)
+        if (cheatMenuHandleEvent(ev) || warpMenuHandleEvent(ev)) {
+            syncMenuInput();
             continue;
         }
 #ifdef __ANDROID__
@@ -1005,6 +1085,7 @@ void sms_gx_pump_events(void) {
 #endif
         }
     }
+    warpMenuTick();
 #endif
 }
 

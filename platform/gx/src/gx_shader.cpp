@@ -392,9 +392,16 @@ static std::string genFS(const ShaderKey& k) {
                 snprintf(buf, sizeof buf, "    iv += ivec3(%d, %d, %d);\n", (bias & 1) ? bv : 0, (bias & 2) ? bv : 0, (bias & 4) ? bv : 0);
                 s += buf;
                 if (mid >= 1 && mid <= 3) {
+                    // The hardware's integer offset: s.10 matrix entries, the product >> 3 in 1/128 texels,
+                    // shifted by the matrix's exponent and kept to the coordinate's 24 bits. Shifted 24 or
+                    // more, nothing is left (Sunshine's goop bubbles, ms_raku_indawa, use an exponent of 29).
                     uint32_t m = mid - 1;
                     snprintf(buf, sizeof buf,
-                             "    vec2 off = vec2(dot(u_indmtx[%u].xyz, vec3(iv)), dot(u_indmtx[%u].xyz, vec3(iv))) * u_indmtx[%u].w;\n",
+                             "    ivec3 m0 = ivec3(u_indmtx[%u].xyz * 1024.0), m1 = ivec3(u_indmtx[%u].xyz * 1024.0);\n"
+                             "    ivec2 it = ivec2(m0.x * iv.x + m0.y * iv.y + m0.z * iv.z, m1.x * iv.x + m1.y * iv.y + m1.z * iv.z) >> 3;\n"
+                             "    int sc = int(u_indmtx[%u].w);\n"
+                             "    it = sc >= 32 ? ivec2(0) : sc >= 0 ? it << sc : it >> -sc;\n"
+                             "    vec2 off = vec2((it << 8) >> 8) / 128.0;\n",
                              m * 2, m * 2 + 1, m * 2);
                 } else {
                     snprintf(buf, sizeof buf, "    vec2 off = vec2(0.0);\n");
@@ -618,6 +625,7 @@ static void setupProgram(GLuint p, ShaderProgram& sp, bool aside = false) {
     sp.uProj = glGetUniformLocation(p, "u_proj");
     sp.uViewport = glGetUniformLocation(p, "u_vp");
     sp.uAmbMat = glGetUniformLocation(p, "u_chan");
+    sp.uLineWidth = glGetUniformLocation(p, "u_linewidth");
     sp.uDstAlpha = -1;
     if (aside) glUseProgram(GLuint(bound));
 }
@@ -685,6 +693,14 @@ static uint64_t driverId() {
 
 static bool programCacheOn() { return s_cacheState == 1; }
 
+// Whether a key read back from the cache file is one buildKey can make. A torn
+// record (a write cut short, or two games appending at once) reads as garbage,
+// and genFS loops numInd times: 0xFFFFFFFF of them ran out of memory.
+static bool programKeyValid(const ProgramKey& key) {
+    const ShaderKey& k = key.k;
+    return k.numTexGens <= 8 && k.numChans <= 3 && k.numStages >= 1 && k.numStages <= 16 && k.numInd <= 4;
+}
+
 // Loads the cached programs (on the GL thread, at the first draw).
 static void programCacheLoad() {
     s_cacheState = 0;
@@ -704,6 +720,7 @@ static void programCacheLoad() {
     const uint64_t driver = driverId();
     unsigned loaded = 0, stale = 0;
     bool keep = false;  // the file is this driver's: append to it
+    bool corrupt = false;
     if (FILE* in = fopen(s_cachePath.c_str(), "rb")) {
         char magic[8];
         uint64_t fileDriver = 0;
@@ -716,11 +733,22 @@ static void programCacheLoad() {
                 uint64_t srcHash;
                 ProgramKey key;
                 uint32_t format, len;
+                int c = fgetc(in);
+                if (c == EOF) break;  // the end, between records
+                ungetc(c, in);
+                // A record cut short, or one that is not a record: those after
+                // it (and any appended to it) are out of step, so start over.
                 if (fread(&srcHash, 8, 1, in) != 1 || fread(&key, sizeof key, 1, in) != 1 ||
-                    fread(&format, 4, 1, in) != 1 || fread(&len, 4, 1, in) != 1 || len > (64u << 20))
+                    fread(&format, 4, 1, in) != 1 || fread(&len, 4, 1, in) != 1 || len > (64u << 20) ||
+                    !programKeyValid(key)) {
+                    corrupt = true;
                     break;
+                }
                 bin.resize(len);
-                if (len && fread(bin.data(), len, 1, in) != 1) break;
+                if (len && fread(bin.data(), len, 1, in) != 1) {
+                    corrupt = true;
+                    break;
+                }
                 if (s_programs.count(key) || sourceHash(genVS(key.k), genFS(key.k)) != srcHash) {
                     stale++;
                     continue;
@@ -744,17 +772,23 @@ static void programCacheLoad() {
         fclose(in);
     }
     if (stale > 64 && stale > loaded) keep = false;  // mostly unusable (repeated or rejected): start over
+    if (corrupt) keep = false;
     s_cacheOut = fopen(s_cachePath.c_str(), keep ? "ab" : "wb");
     if (!s_cacheOut) return;
+    // Unbuffered, so that each record (programCacheStore) is one append that
+    // another game running at the same time cannot land in the middle of.
+    setvbuf(s_cacheOut, nullptr, _IONBF, 0);
     if (!keep) {
         const uint32_t keySize = sizeof(ProgramKey);
-        fwrite(kCacheMagic, 8, 1, s_cacheOut);
-        fwrite(&driver, 8, 1, s_cacheOut);
-        fwrite(&keySize, 4, 1, s_cacheOut);
-        fflush(s_cacheOut);
+        uint8_t head[20];
+        memcpy(head, kCacheMagic, 8);
+        memcpy(head + 8, &driver, 8);
+        memcpy(head + 16, &keySize, 4);
+        fwrite(head, sizeof head, 1, s_cacheOut);
     }
     s_cacheState = 1;
     if (keep) logmsg("shader cache: %u programs loaded, %u skipped (%s)", loaded, stale, s_cachePath.c_str());
+    else if (corrupt) logmsg("shader cache: damaged after %u programs, made anew (%s)", loaded, s_cachePath.c_str());
     else logmsg("shader cache: new (%s)", s_cachePath.c_str());
 }
 
@@ -763,18 +797,19 @@ static void programCacheStore(const ProgramKey& key, uint64_t srcHash, GLuint p)
     GLint len = 0;
     glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
     if (len <= 0) return;
-    std::vector<uint8_t> bin(static_cast<size_t>(len));
+    // The record in one buffer: srcHash, key, format, length, binary.
+    const size_t head = 8 + sizeof key + 4 + 4;
+    std::vector<uint8_t> rec(head + static_cast<size_t>(len));
     GLenum format = 0;
     GLsizei got = 0;
-    glGetProgramBinary(p, len, &got, &format, bin.data());
+    glGetProgramBinary(p, len, &got, &format, rec.data() + head);
     if (got <= 0) return;
     const uint32_t fmt = format, n = uint32_t(got);
-    fwrite(&srcHash, 8, 1, s_cacheOut);
-    fwrite(&key, sizeof key, 1, s_cacheOut);
-    fwrite(&fmt, 4, 1, s_cacheOut);
-    fwrite(&n, 4, 1, s_cacheOut);
-    fwrite(bin.data(), n, 1, s_cacheOut);
-    fflush(s_cacheOut);
+    memcpy(rec.data(), &srcHash, 8);
+    memcpy(rec.data() + 8, &key, sizeof key);
+    memcpy(rec.data() + 8 + sizeof key, &fmt, 4);
+    memcpy(rec.data() + 8 + sizeof key + 4, &n, 4);
+    fwrite(rec.data(), head + n, 1, s_cacheOut);
 }
 
 // ------------------------------------------------------------------ warm-up
@@ -1013,7 +1048,97 @@ void shaderPrepareStage(int stage) {
                s_warmMade - before - own, elapsed(), s_warmNext < s_warmKeys.size() ? "" : " (all known programs made)");
 }
 
-const ShaderProgram* shaderForCurrentState(bool depthOnly, bool metric) {
+// ------------------------------------------------------------------ lines
+// GX draws a line as a quad GXSetLineWidth sixths of an EFB pixel wide,
+// widened along the minor axis. GL's own lines are one pixel of the scaled
+// EFB, and wider ones are missing from forward-compatible core contexts
+// (macOS), so 1-pixel lines at a 4x EFB leave three rows in four uncovered:
+// the iris wipes' black field (one line per row) turned into a translucent
+// grey stripe pattern. Line batches draw through the same program with a
+// geometry shader that makes the quads; only a few 2D draws (the wipes) use
+// lines, so these are kept apart from s_programs, the program cache and the
+// warm-up's keys, and compiled when first drawn.
+static const char* const kLineVaryings[][2] = {
+    {"vec4", "c0"},  {"vec4", "c1"},  {"vec3", "tc0"}, {"vec3", "tc1"}, {"vec3", "tc2"},
+    {"vec3", "tc3"}, {"vec3", "tc4"}, {"vec3", "tc5"}, {"vec3", "tc6"}, {"vec3", "tc7"},
+};
+
+// The vertex shader's outputs renamed (v_ to vl_), as the geometry shader's inputs.
+static std::string genLineVS(const ShaderKey& k) {
+    std::string vs = genVS(k), defs;
+    for (const auto& v : kLineVaryings) defs += std::string("#define v_") + v[1] + " vl_" + v[1] + "\n";
+    return vs.insert(vs.find('\n') + 1, defs);
+}
+
+static std::string genLineGS() {
+    std::string s = "#version 330 core\n"
+                    "layout(lines) in;\n"
+                    "layout(triangle_strip, max_vertices = 4) out;\n"
+                    "uniform vec2 u_efb;\n"
+                    "uniform float u_linewidth;  // EFB pixels\n";
+    for (const auto& v : kLineVaryings)
+        s += std::string("in ") + v[0] + " vl_" + v[1] + "[]; out " + v[0] + " v_" + v[1] + ";\n";
+    s += "void main() {\n"
+         "  vec4 a = gl_in[0].gl_Position, b = gl_in[1].gl_Position;\n"
+         "  vec2 d = (b.xy / max(abs(b.w), 1e-6) - a.xy / max(abs(a.w), 1e-6)) * u_efb;\n"
+         "  vec2 off = abs(d.y) > abs(d.x) ? vec2(u_linewidth / u_efb.x, 0.0) : vec2(0.0, u_linewidth / u_efb.y);\n";
+    // each end, then each side of it; constant indices, as gl_ClipDistance is unsized
+    for (int i = 0; i < 4; i++) {
+        char buf[256];
+        const int e = i >> 1;
+        snprintf(buf, sizeof buf,
+                 "  gl_Position = gl_in[%d].gl_Position + vec4(%soff * gl_in[%d].gl_Position.w, 0.0, 0.0);\n"
+                 "  gl_ClipDistance[0] = gl_in[%d].gl_ClipDistance[0];\n"
+                 "  gl_ClipDistance[1] = gl_in[%d].gl_ClipDistance[1];\n",
+                 e, i & 1 ? "" : "-", e, e, e);
+        s += buf;
+        for (const auto& v : kLineVaryings) s += std::string("  v_") + v[1] + " = vl_" + v[1] + "[" + char('0' + e) + "];\n";
+        s += "  EmitVertex();\n";
+    }
+    return s + "  EndPrimitive();\n}\n";
+}
+
+static std::unordered_map<ProgramKey, ShaderProgram, ProgramKeyHash> s_linePrograms;
+static bool s_lineProgramsFailed = false;  // one did not link: lines are drawn one pixel wide
+
+static const ShaderProgram* lineProgram(const ProgramKey& key) {
+    auto it = s_linePrograms.find(key);
+    if (it != s_linePrograms.end()) return &it->second;
+    g_statShaderCompiles++;
+    std::string vs = genLineVS(key.k), gs = genLineGS(), fs = genFS(key.k);
+    ShaderProgram sp;
+    glt::sync([&] {
+        GLuint v = compile(GL_VERTEX_SHADER, vs), gm = compile(GL_GEOMETRY_SHADER, gs),
+               f = compile(GL_FRAGMENT_SHADER, fs);
+        GLuint p = glCreateProgram();
+        glAttachShader(p, v);
+        glAttachShader(p, gm);
+        glAttachShader(p, f);
+        bindAttributes(p);
+        glLinkProgram(p);
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[4096];
+            glGetProgramInfoLog(p, sizeof log, nullptr, log);
+            logmsg("line program link failed, drawing lines one pixel wide: %s", log);
+        }
+        glDeleteShader(v);
+        glDeleteShader(gm);
+        glDeleteShader(f);
+        if (!ok) {
+            glDeleteProgram(p);
+            s_lineProgramsFailed = true;
+            return;
+        }
+        sp.id = int(g_statShaderCompiles);
+        setupProgram(p, sp);
+    });
+    if (s_lineProgramsFailed) return nullptr;
+    return &(s_linePrograms[key] = sp);
+}
+
+const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines, bool metric) {
     if (s_cacheState < 0) shaderSetup();
     ProgramKey key;
     ShaderKey& k = key.k;
@@ -1026,6 +1151,9 @@ const ShaderProgram* shaderForCurrentState(bool depthOnly, bool metric) {
 #endif
     key.indScale[0] = k.numInd ? g.bp[BP_RAS1_SS0] : 0;
     key.indScale[1] = k.numInd ? g.bp[BP_RAS1_SS0 + 1] : 0;
+    // without geometry shaders (some GLES drivers) lines stay one pixel wide
+    if (lines && !s_lineProgramsFailed && android::geometryShaders())
+        if (const ShaderProgram* sp = lineProgram(key)) return sp;
     // consecutive batches mostly share a program
     if (s_lastProgram && key == s_lastKey) return s_lastProgram;
     recordKey(key);
@@ -1085,6 +1213,8 @@ void shaderShutdown() {
     s_cacheState = -1;
     for (auto& kv : s_programs) glDeleteProgram(kv.second.prog);
     s_programs.clear();
+    for (auto& kv : s_linePrograms) glDeleteProgram(kv.second.prog);
+    s_linePrograms.clear();
     s_lastProgram = nullptr;
     s_earlyFragmentTests = -1;
 }

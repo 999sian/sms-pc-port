@@ -1,7 +1,8 @@
-// PAD: controller 1 from the keyboard and/or an SDL game controller; ports
-// 2-4 are empty. Input arrives as SDL2 events through the GX layer's event
-// hook (sms_gx_set_event_callback / sms_gx_pump_events, weak here so the port
-// still links and runs without platform/gx). Bindings load from bindings.txt
+// PAD: controller 1 from the keyboard, an SDL game controller and/or a GameCube
+// adapter (gc_adapter.cpp); ports 2-4 are empty. Input arrives as SDL2 events
+// through the GX layer's event hook (sms_gx_set_event_callback /
+// sms_gx_pump_events, weak here so the port still links and runs without
+// platform/gx). Bindings load from bindings.txt
 // (see README.md); SMS_BINDINGS=path overrides the location. Controller 1's
 // rumble motor drives the controller in use (sms_gx_rumble).
 //
@@ -9,6 +10,8 @@
 // SDL headers or library: the 32-bit build works without i386 SDL packages.
 #include "port_compat.h"
 #include "port_platform.h"
+#include "port_savestate.h"
+#include "gc_adapter.h"
 #include <dolphin/pad.h>
 #include <string.h>
 #include <strings.h>
@@ -74,215 +77,11 @@ f32 port_camera_speed_x   = 1.0f;
 f32 port_camera_speed_y   = 1.0f;
 }
 
-#ifdef _WIN32
-// --- Native GameCube adapter (Nintendo / Mayflash in Wii U mode, 057e:0337) ----
-// In that mode the adapter is a WinUSB device (driver installed by Zadig or
-// Dolphin), which SDL cannot read without libusb. A thread polls it through
-// winusb.dll / setupapi.dll, loaded at run time so nothing extra is linked.
-// The first connected port feeds controller 1 alongside the keyboard and SDL pad.
-#include <windows.h>
-namespace gcad {
-typedef void* HDEVINFO_;
-struct SpDevinfoData { DWORD cbSize; GUID ClassGuid; DWORD DevInst; ULONG_PTR Reserved; };
-struct SpDeviceInterfaceData { DWORD cbSize; GUID InterfaceClassGuid; DWORD Flags; ULONG_PTR Reserved; };
-struct SpDeviceInterfaceDetailW { DWORD cbSize; WCHAR DevicePath[1]; };
-
-typedef HDEVINFO_ (WINAPI *PGetClassDevs)(const GUID*, PCWSTR, HWND, DWORD);
-typedef BOOL (WINAPI *PEnumDeviceInfo)(HDEVINFO_, DWORD, SpDevinfoData*);
-typedef BOOL (WINAPI *PGetInstanceId)(HDEVINFO_, SpDevinfoData*, PWSTR, DWORD, PDWORD);
-typedef HKEY (WINAPI *POpenDevRegKey)(HDEVINFO_, SpDevinfoData*, DWORD, DWORD, DWORD, REGSAM);
-typedef BOOL (WINAPI *PEnumInterfaces)(HDEVINFO_, SpDevinfoData*, const GUID*, DWORD, SpDeviceInterfaceData*);
-typedef BOOL (WINAPI *PGetDetail)(HDEVINFO_, SpDeviceInterfaceData*, SpDeviceInterfaceDetailW*, DWORD, PDWORD, SpDevinfoData*);
-typedef BOOL (WINAPI *PDestroyList)(HDEVINFO_);
-typedef BOOL (WINAPI *PWuInit)(HANDLE, void**);
-typedef BOOL (WINAPI *PWuFree)(void*);
-typedef BOOL (WINAPI *PWuWrite)(void*, UCHAR, PUCHAR, ULONG, PULONG, void*);
-typedef BOOL (WINAPI *PWuRead)(void*, UCHAR, PUCHAR, ULONG, PULONG, void*);
-typedef BOOL (WINAPI *PWuPolicy)(void*, UCHAR, ULONG, ULONG, PVOID);
-
-PGetClassDevs pGetClassDevs; PEnumDeviceInfo pEnumDeviceInfo; PGetInstanceId pGetInstanceId;
-POpenDevRegKey pOpenDevRegKey; PEnumInterfaces pEnumInterfaces; PGetDetail pGetDetail; PDestroyList pDestroyList;
-PWuInit pWuInit; PWuFree pWuFree; PWuWrite pWuWrite; PWuRead pWuRead; PWuPolicy pWuPolicy;
-
-// latest report of the first connected port (written by the thread, read by PADRead)
-struct State {
-	volatile LONG present;
-	volatile LONG b1, b2, lx, ly, cx, cy, lt, rt; // raw bytes minus the power-on origin
-	volatile LONG rumble;                          // written by PADControlMotor
-};
-State g_state;
-
-bool load()
-{
-	HMODULE sa = LoadLibraryA("setupapi.dll");
-	HMODULE wu = LoadLibraryA("winusb.dll");
-	if (!sa || !wu)
-		return false;
-	pGetClassDevs   = (PGetClassDevs)GetProcAddress(sa, "SetupDiGetClassDevsW");
-	pEnumDeviceInfo = (PEnumDeviceInfo)GetProcAddress(sa, "SetupDiEnumDeviceInfo");
-	pGetInstanceId  = (PGetInstanceId)GetProcAddress(sa, "SetupDiGetDeviceInstanceIdW");
-	pOpenDevRegKey  = (POpenDevRegKey)GetProcAddress(sa, "SetupDiOpenDevRegKey");
-	pEnumInterfaces = (PEnumInterfaces)GetProcAddress(sa, "SetupDiEnumDeviceInterfaces");
-	pGetDetail      = (PGetDetail)GetProcAddress(sa, "SetupDiGetDeviceInterfaceDetailW");
-	pDestroyList    = (PDestroyList)GetProcAddress(sa, "SetupDiDestroyDeviceInfoList");
-	pWuInit         = (PWuInit)GetProcAddress(wu, "WinUsb_Initialize");
-	pWuFree         = (PWuFree)GetProcAddress(wu, "WinUsb_Free");
-	pWuWrite        = (PWuWrite)GetProcAddress(wu, "WinUsb_WritePipe");
-	pWuRead         = (PWuRead)GetProcAddress(wu, "WinUsb_ReadPipe");
-	pWuPolicy       = (PWuPolicy)GetProcAddress(wu, "WinUsb_SetPipePolicy");
-	return pGetClassDevs && pEnumDeviceInfo && pGetInstanceId && pOpenDevRegKey && pEnumInterfaces && pGetDetail &&
-	       pDestroyList && pWuInit && pWuFree && pWuWrite && pWuRead && pWuPolicy;
+// SMS_RUMBLE_STRENGTH above 100: how much more often the game runs the motor,
+// read by RumbleBase::update (decomp-patches/port-10-rumble-boost.patch).
+extern "C" {
+f32 port_rumble_boost = 1.0f;
 }
-
-// USB ids of GameCube adapters that speak the Nintendo protocol: the official
-// adapter (WUP-028) and the clones that copy it, e.g. Mayflash in Wii U mode.
-// SMS_GC_ADAPTER=VVVV:PPPP (hex) adds another. Adapters in HID/PC mode show up
-// as ordinary joysticks and go through SDL instead.
-bool is_adapter(const WCHAR* id)
-{
-	static const struct { unsigned vid, pid; } known[] = { { 0x057E, 0x0337 } };
-	WCHAR want[64];
-	for (size_t i = 0; i < sizeof known / sizeof known[0]; i++) {
-		swprintf(want, 64, L"USB\\VID_%04X&PID_%04X", known[i].vid, known[i].pid);
-		if (_wcsnicmp(id, want, wcslen(want)) == 0)
-			return true;
-	}
-	unsigned v, p;
-	const char* e = getenv("SMS_GC_ADAPTER");
-	if (e && sscanf(e, "%x:%x", &v, &p) == 2) {
-		swprintf(want, 64, L"USB\\VID_%04X&PID_%04X", v & 0xFFFF, p & 0xFFFF);
-		return _wcsnicmp(id, want, wcslen(want)) == 0;
-	}
-	return false;
-}
-
-// Device path of the adapter's WinUSB interface, or an empty string.
-bool find_path(WCHAR* out, size_t cap)
-{
-	HDEVINFO_ set = pGetClassDevs(NULL, L"USB", NULL, 0x2 | 0x4 /* DIGCF_PRESENT | DIGCF_ALLCLASSES */);
-	if (set == (HDEVINFO_)INVALID_HANDLE_VALUE)
-		return false;
-	bool found = false;
-	SpDevinfoData dev;
-	for (DWORD i = 0; !found; i++) {
-		dev.cbSize = sizeof dev;
-		if (!pEnumDeviceInfo(set, i, &dev))
-			break;
-		WCHAR id[200];
-		if (!pGetInstanceId(set, &dev, id, 200, NULL) || !is_adapter(id))
-			continue;
-		HKEY key = pOpenDevRegKey(set, &dev, 1 /* DICS_FLAG_GLOBAL */, 0, 1 /* DIREG_DEV */, KEY_READ);
-		if (key == (HKEY)INVALID_HANDLE_VALUE)
-			continue;
-		WCHAR guids[200] = {};
-		DWORD sz         = sizeof guids - 4;
-		LSTATUS st       = RegQueryValueExW(key, L"DeviceInterfaceGUIDs", NULL, NULL, (LPBYTE)guids, &sz);
-		RegCloseKey(key);
-		if (st != ERROR_SUCCESS || !guids[0])
-			continue;
-		// Device path = \\?\ + instance id with separators turned into '#' + '#' + interface GUID
-		// (the first "{...}" of DeviceInterfaceGUIDs).
-		for (WCHAR* c = id; *c; c++)
-			if (*c == L'\\' || *c == L'/')
-				*c = L'#';
-		swprintf(out, cap, L"\\\\?\\%ls#%ls", id, guids);
-		found = true;
-	}
-	pDestroyList(set);
-	return found;
-}
-
-DWORD WINAPI poll_thread(void*)
-{
-	for (;;) {
-		WCHAR path[512];
-		if (!find_path(path, 512)) {
-			Sleep(1000);
-			continue;
-		}
-		HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-		                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
-		void* wu = NULL;
-		if (h == INVALID_HANDLE_VALUE || !pWuInit(h, &wu)) {
-			if (h != INVALID_HANDLE_VALUE)
-				CloseHandle(h);
-			Sleep(1000);
-			continue;
-		}
-		port_log("[pad] GameCube adapter opened (WinUSB)\n");
-		ULONG timeout = 100;
-		pWuPolicy(wu, 0x81, 0x03 /* PIPE_TRANSFER_TIMEOUT */, sizeof timeout, &timeout);
-		UCHAR init = 0x13;
-		ULONG n    = 0;
-		pWuWrite(wu, 0x02, &init, 1, &n, NULL);
-		int origin[4]  = { 128, 128, 128, 128 };
-		bool haveOrigin = false;
-		int slot        = -1; // the port feeding controller 1
-		int motor       = 0;  // the port whose motor runs, 1-4, or 0
-		for (;;) {
-			// Rumble: one byte per port after 0x11. The motors only run with
-			// the adapter's second (power) cable plugged in.
-			const int want = g_state.rumble && slot >= 0 ? slot + 1 : 0;
-			if (want != motor) {
-				UCHAR cmd[5] = { 0x11, 0, 0, 0, 0 };
-				if (want)
-					cmd[want] = 1;
-				pWuWrite(wu, 0x02, cmd, sizeof cmd, &n, NULL);
-				motor = want;
-			}
-			UCHAR rep[37];
-			n = 0;
-			if (!pWuRead(wu, 0x81, rep, sizeof rep, &n, NULL)) {
-				if (GetLastError() == ERROR_SEM_TIMEOUT)
-					continue;
-				break; // unplugged
-			}
-			if (n < 37 || rep[0] != 0x21)
-				continue;
-			if (slot < 0 || !(rep[1 + slot * 9] & 0x30)) {
-				slot = -1;
-				for (int p = 0; p < 4; p++)
-					if (rep[1 + p * 9] & 0x30) { // wired or WaveBird
-						slot = p;
-						break;
-					}
-				haveOrigin = false;
-			}
-			if (slot < 0) {
-				InterlockedExchange(&g_state.present, 0);
-				continue;
-			}
-			const UCHAR* c = rep + 1 + slot * 9;
-			if (!haveOrigin) { // sticks as found on connect are centre, as on hardware
-				for (int k = 0; k < 4; k++)
-					origin[k] = c[3 + k];
-				haveOrigin = true;
-			}
-			InterlockedExchange(&g_state.b1, c[1]);
-			InterlockedExchange(&g_state.b2, c[2]);
-			InterlockedExchange(&g_state.lx, (LONG)c[3] - origin[0]);
-			InterlockedExchange(&g_state.ly, (LONG)c[4] - origin[1]);
-			InterlockedExchange(&g_state.cx, (LONG)c[5] - origin[2]);
-			InterlockedExchange(&g_state.cy, (LONG)c[6] - origin[3]);
-			InterlockedExchange(&g_state.lt, c[7]);
-			InterlockedExchange(&g_state.rt, c[8]);
-			InterlockedExchange(&g_state.present, 1);
-		}
-		InterlockedExchange(&g_state.present, 0);
-		pWuFree(wu);
-		CloseHandle(h);
-		port_log("[pad] GameCube adapter disconnected\n");
-	}
-}
-
-void start()
-{
-	if (getenv("SMS_NO_GC_ADAPTER") || !load())
-		return;
-	CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
-}
-} // namespace gcad
-#endif
 
 namespace {
 
@@ -291,15 +90,20 @@ enum Control {
 	C_DUP, C_DDOWN, C_DLEFT, C_DRIGHT,
 	C_UP, C_DOWN, C_LEFT, C_RIGHT,
 	C_CUP, C_CDOWN, C_CLEFT, C_CRIGHT,
-	C_HALF, C_QUIT, C_LSOFT, C_RSOFT, C_COUNT
+	C_HALF, C_QUIT, C_LSOFT, C_RSOFT, C_SAVESTATE, C_LOADSTATE, C_COUNT
 };
 const char* const kControlNames[C_COUNT] = {
 	"A", "B", "X", "Y", "Z", "L", "R", "START",
 	"DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT",
 	"STICK_UP", "STICK_DOWN", "STICK_LEFT", "STICK_RIGHT",
 	"CSTICK_UP", "CSTICK_DOWN", "CSTICK_LEFT", "CSTICK_RIGHT",
-	"HALF_TILT", "QUIT", "L_SOFT", "R_SOFT",
+	"HALF_TILT", "QUIT", "L_SOFT", "R_SOFT", "SAVE_STATE", "LOAD_STATE",
 };
+// SAVE_STATE / LOAD_STATE are the port's, not the GameCube's: a press saves a
+// save state, or loads the newest (port_savestate.h). Their bindings are often
+// two buttons held together (PAD_LB+PAD_RB), and holding one of the pair keeps
+// the other from the game (combo_masks below).
+bool is_port_action(int c) { return c == C_SAVESTATE || c == C_LOADSTATE; }
 // L_SOFT / R_SOFT press L or R part of the way, analog only (no digital click):
 // a light press, as on a GameCube trigger before it clicks. How far, 0..255,
 // from SMS_SOFT_TRIGGER (percent, default 40). Unbound unless bindings.txt
@@ -320,6 +124,8 @@ const KeyName kKeys[] = {
 	{ "ESC", 41 }, { "BACKSPACE", 42 }, { "TAB", 43 }, { "SPACE", 44 }, { "MINUS", 45 }, { "EQUALS", 46 },
 	{ "LBRACKET", 47 }, { "RBRACKET", 48 }, { "SEMICOLON", 51 }, { "APOSTROPHE", 52 }, { "COMMA", 54 },
 	{ "PERIOD", 55 }, { "SLASH", 56 }, { "F1", 58 }, { "F2", 59 }, { "F3", 60 }, { "F4", 61 },
+	{ "F5", 62 }, { "F6", 63 }, { "F7", 64 }, { "F8", 65 }, { "F9", 66 }, { "F10", 67 }, { "F11", 68 },
+	{ "F12", 69 },
 	{ "RIGHT", 79 }, { "LEFT", 80 }, { "DOWN", 81 }, { "UP", 82 },
 	{ "KP_DIVIDE", 84 }, { "KP_MULTIPLY", 85 }, { "KP_MINUS", 86 }, { "KP_PLUS", 87 }, { "KP_ENTER", 88 },
 	{ "KP_1", 89 }, { "KP_2", 90 }, { "KP_3", 91 }, { "KP_4", 92 }, { "KP_5", 93 }, { "KP_6", 94 },
@@ -350,7 +156,17 @@ const char* const kDefaultBindings =
     "CSTICK_LEFT = J\n"
     "CSTICK_RIGHT = L\n"
     "HALF_TILT = LCTRL\n"
-    "QUIT = ESCAPE\n";
+    "QUIT = ESCAPE\n"
+    "SAVE_STATE = F5\n"
+    "LOAD_STATE = F6\n";
+
+// A binding is one key or controller button, or two held together, written
+// FIRST+SECOND (PAD_LB+PAD_RB, LCTRL+S): the second's code plus one sits above
+// kComboShift.
+const int kComboShift = 10;
+int combo(int first, int second) { return first | (second + 1) << kComboShift; }
+int combo_first(int bind) { return bind & ((1 << kComboShift) - 1); }
+int combo_second(int bind) { return (bind >> kComboShift) - 1; }
 
 const int kMaxKeys = 8;
 int g_bind[C_COUNT][kMaxKeys];
@@ -379,6 +195,7 @@ int g_npbind[C_COUNT];
 const struct { int control, source; } kDefaultPad[] = {
 	{ C_A, 0 }, { C_B, 1 }, { C_X, 2 }, { C_Y, 3 }, { C_Z, 10 }, { C_L, PAD_SRC_LT }, { C_R, PAD_SRC_RT },
 	{ C_START, 6 }, { C_DUP, 11 }, { C_DDOWN, 12 }, { C_DLEFT, 13 }, { C_DRIGHT, 14 },
+	{ C_SAVESTATE, combo(9, 10) }, // L1 + R1 (LB + RB)
 };
 bool g_inited;
 // SMS_CAMERA_INVERT_X / SMS_CAMERA_INVERT_Y=1 flip the C-stick, which only
@@ -399,6 +216,8 @@ bool g_focused = true, g_backgroundInput;
 // running it on some frames only (RumbleMgr), and the controller plays it the
 // same way. SMS_RUMBLE=0 turns it off; SMS_RUMBLE_STRENGTH=percent scales it
 // (SDL controllers only: the GameCube adapter's motors are on or off too).
+// Above 100 the motor is at full strength and the game runs it on more frames
+// (port_rumble_boost, decomp-patches/port-10), on every controller.
 u16 g_rumbleStrength = 0xFFFF;
 bool g_motor; // controller 1's motor, as the game last set it
 
@@ -408,9 +227,7 @@ void update_rumble()
 	const bool on = g_motor && g_focused && g_rumbleStrength;
 	if (sms_gx_rumble)
 		sms_gx_rumble(on ? g_rumbleStrength : 0);
-#ifdef _WIN32
-	InterlockedExchange(&gcad::g_state.rumble, on);
-#endif
+	gc_adapter_rumble(on);
 }
 
 void stop_rumble_at_exit()
@@ -419,9 +236,7 @@ void stop_rumble_at_exit()
 		return;
 	g_motor = false;
 	update_rumble();
-#ifdef _WIN32
-	Sleep(30); // for the adapter's thread to send it
-#endif
+	gc_adapter_flush_rumble();
 }
 
 void release_all()
@@ -498,21 +313,30 @@ void parse_bindings(const char* text, const char* source)
 		int keys[kMaxKeys], nkeys = 0, pads[kMaxPad], npads = 0;
 		bool anyKey = false, anyPad = false;
 		for (char* k = strtok(eq + 1, " \t,"); k; k = strtok(NULL, " \t,")) {
-			if (strncasecmp(k, "PAD_", 4) == 0) {
+			// FIRST+SECOND: two keys or two controller buttons held together
+			char* second = strchr(k, '+');
+			if (second)
+				*second++ = 0;
+			const bool pad = strncasecmp(k, "PAD_", 4) == 0;
+			if (second && (strncasecmp(second, "PAD_", 4) == 0) != pad) {
+				port_log("[pad] %s:%d: '%s+%s' mixes a key and a controller button\n", source, line, k, second);
+				continue;
+			}
+			if (pad) {
 				anyPad   = true;
-				int code = pad_code(k);
-				if (code < 0)
-					port_log("[pad] %s:%d: unknown controller button '%s'\n", source, line, k);
+				int code = pad_code(k), code2 = second ? pad_code(second) : -1;
+				if (code < 0 || (second && code2 < 0))
+					port_log("[pad] %s:%d: unknown controller button '%s'\n", source, line, code < 0 ? k : second);
 				else if (npads < kMaxPad)
-					pads[npads++] = code;
+					pads[npads++] = second ? combo(code, code2) : code;
 				continue;
 			}
 			anyKey   = true;
-			int code = key_code(k);
-			if (code < 0 || code >= 512)
-				port_log("[pad] %s:%d: unknown key '%s'\n", source, line, k);
+			int code = key_code(k), code2 = second ? key_code(second) : -1;
+			if (code < 0 || code >= 512 || (second && (code2 < 0 || code2 >= 512)))
+				port_log("[pad] %s:%d: unknown key '%s'\n", source, line, code < 0 || code >= 512 ? k : second);
 			else if (nkeys < kMaxKeys)
-				keys[nkeys++] = code;
+				keys[nkeys++] = second ? combo(code, code2) : code;
 		}
 		// each part replaces only its own defaults; an empty line clears the keys
 		if (anyKey || !anyPad) {
@@ -524,9 +348,11 @@ void parse_bindings(const char* text, const char* source)
 			g_npbind[c] = npads;
 			char list[96] = "";
 			for (int i = 0; i < npads; i++)
-				for (size_t j = 0; j < sizeof kPadButtons / sizeof kPadButtons[0]; j++)
-					if (kPadButtons[j].code == pads[i])
-						snprintf(list + strlen(list), sizeof list - strlen(list), " %s", kPadButtons[j].name);
+				for (int part = 0; part < 2; part++)
+					for (size_t j = 0; j < sizeof kPadButtons / sizeof kPadButtons[0]; j++)
+						if (kPadButtons[j].code == (part ? combo_second(pads[i]) : combo_first(pads[i])))
+							snprintf(list + strlen(list), sizeof list - strlen(list), "%s%s",
+							         part ? "+" : " ", kPadButtons[j].name);
 			port_log("[pad] %s: controller %s =%s\n", source, kControlNames[c], npads ? list : " (none)");
 		}
 	}
@@ -592,15 +418,58 @@ void on_event(const union SDL_Event* ev)
 // How far a trigger is pressed, 0..255.
 int trigger(int source) { return g_axis[source == PAD_SRC_LT ? 4 : 5] > 0 ? g_axis[source == PAD_SRC_LT ? 4 : 5] * 255 / 32767 : 0; }
 
-// A control's bound keys or controller buttons (a trigger counts once it clicks).
+// Keys and controller buttons the game does not see, because the other half
+// of a port action's two-button binding is held (combo_masks).
+bool g_keyMasked[512], g_padMasked[PAD_SRC_COUNT];
+
+bool pad_down(int s) { return s == PAD_SRC_LT || s == PAD_SRC_RT ? trigger(s) >= 250 : g_cbtn[s]; }
+// Pressed at all: a trigger part of the way counts.
+bool pad_touched(int s) { return s == PAD_SRC_LT || s == PAD_SRC_RT ? trigger(s) >= 26 : g_cbtn[s]; }
+
+// Holding one half of a port action's two-button binding (LB of LB+RB) hides
+// the other half from the game until that is let go, so saving a state with
+// L1 + R1 (LB + RB) does not also press Z.
+void combo_masks()
+{
+	bool key[512] = {}, pad[PAD_SRC_COUNT] = {};
+	for (int c = 0; c < C_COUNT; c++) {
+		if (!is_port_action(c))
+			continue;
+		for (int i = 0; i < g_nbind[c]; i++) {
+			const int a = combo_first(g_bind[c][i]), b = combo_second(g_bind[c][i]);
+			if (b >= 0) {
+				key[a] = key[a] || g_key[b];
+				key[b] = key[b] || g_key[a];
+			}
+		}
+		for (int i = 0; i < g_npbind[c]; i++) {
+			const int a = combo_first(g_pbind[c][i]), b = combo_second(g_pbind[c][i]);
+			if (b >= 0) {
+				pad[a] = pad[a] || pad_touched(b);
+				pad[b] = pad[b] || pad_touched(a);
+			}
+		}
+	}
+	for (int k = 0; k < 512; k++)
+		g_keyMasked[k] = key[k] || (g_keyMasked[k] && g_key[k]);
+	for (int s = 0; s < PAD_SRC_COUNT; s++)
+		g_padMasked[s] = pad[s] || (g_padMasked[s] && pad_touched(s));
+}
+
+// A control's bound keys or controller buttons (a trigger counts once it
+// clicks); a two-button binding needs both. The game's controls skip what
+// combo_masks hides.
 bool held(int c)
 {
-	for (int i = 0; i < g_nbind[c]; i++)
-		if (g_key[g_bind[c][i]])
+	const bool game = !is_port_action(c);
+	for (int i = 0; i < g_nbind[c]; i++) {
+		const int a = combo_first(g_bind[c][i]), b = combo_second(g_bind[c][i]);
+		if (g_key[a] && !(game && g_keyMasked[a]) && (b < 0 || (g_key[b] && !(game && g_keyMasked[b]))))
 			return true;
+	}
 	for (int i = 0; i < g_npbind[c]; i++) {
-		const int s = g_pbind[c][i];
-		if (s == PAD_SRC_LT || s == PAD_SRC_RT ? trigger(s) >= 250 : g_cbtn[s])
+		const int a = combo_first(g_pbind[c][i]), b = combo_second(g_pbind[c][i]);
+		if (pad_down(a) && !(game && g_padMasked[a]) && (b < 0 || (pad_down(b) && !(game && g_padMasked[b]))))
 			return true;
 	}
 	return false;
@@ -610,9 +479,11 @@ bool held(int c)
 int analog_trigger(int c)
 {
 	int v = 0;
-	for (int i = 0; i < g_npbind[c]; i++)
-		if (g_pbind[c][i] == PAD_SRC_LT || g_pbind[c][i] == PAD_SRC_RT)
-			v = std::max(v, trigger(g_pbind[c][i]));
+	for (int i = 0; i < g_npbind[c]; i++) {
+		const int s = g_pbind[c][i];
+		if ((s == PAD_SRC_LT || s == PAD_SRC_RT) && !g_padMasked[s])
+			v = std::max(v, trigger(s));
+	}
 	return held(c) ? 255 : v;
 }
 
@@ -651,8 +522,9 @@ void init()
 		}
 	if (const char* e = getenv("SMS_RUMBLE_STRENGTH"))
 		if (*e && g_rumbleStrength) {
-			const int pct    = atoi(e) < 0 ? 0 : atoi(e) > 100 ? 100 : atoi(e);
-			g_rumbleStrength = (u16)(pct * 0xFFFF / 100);
+			const int pct    = atoi(e) < 0 ? 0 : atoi(e) > 200 ? 200 : atoi(e);
+			g_rumbleStrength = (u16)((pct < 100 ? pct : 100) * 0xFFFF / 100);
+			port_rumble_boost = pct > 100 ? pct / 100.0f : 1.0f;
 			port_log("[pad] rumble strength: %d%%\n", pct);
 		}
 	atexit(stop_rumble_at_exit);
@@ -682,9 +554,7 @@ void init()
 		parse_bindings(text, path);
 		port_log("[pad] loaded key bindings from %s\n", path);
 	}
-#ifdef _WIN32
-	gcad::start();
-#endif
+	gc_adapter_start();
 	if (sms_gx_set_event_callback)
 		sms_gx_set_event_callback(on_event);
 	else
@@ -759,6 +629,14 @@ void send_key(int scancode, bool down)
 	g_key[scancode] = down;
 }
 
+// Both keys of a two-key binding, the first pressed first.
+void send_binding(int bind, bool down)
+{
+	send_key(combo_first(bind), down);
+	if (combo_second(bind) >= 0)
+		send_key(combo_second(bind), down);
+}
+
 } // namespace
 
 extern "C" void port_pad_autopress_field(u32 field)
@@ -770,12 +648,54 @@ extern "C" void port_pad_autopress_field(u32 field)
 		if (!a.down && field >= a.at) {
 			a.down = true;
 			port_log("[pad] autopress %s down at field %u\n", kControlNames[a.control], field);
-			send_key(g_bind[a.control][0], true);
+			send_binding(g_bind[a.control][0], true);
 		} else if (a.down && field >= a.until) {
 			a.done = true;
-			send_key(g_bind[a.control][0], false);
+			send_binding(g_bind[a.control][0], false);
 		}
 	}
+}
+
+// SAVE_STATE's first binding as the pause menu's hint names it
+// (port_savestate.h): the keyboard's key names, or a controller's buttons as
+// that kind of controller labels them, indexed by SDL button (kPadButtons).
+extern "C" int port_pad_savestate_labels(int style, char labels[2][16])
+{
+	static const char* const kXbox[PAD_SRC_COUNT] = {
+		"A", "B", "X", "Y", "View", "Xbox", "Menu", "LS", "RS", "LB", "RB", "Up", "Down", "Left", "Right",
+		"Share", "P1", "P2", "P3", "P4", "Touchpad", "LT", "RT",
+	};
+	static const char* const kPlayStation[PAD_SRC_COUNT] = {
+		"Cross", "Circle", "Square", "Triangle", "Create", "PS", "Options", "L3", "R3", "L1", "R1", "Up", "Down",
+		"Left", "Right", "Mic", "P1", "P2", "P3", "P4", "Touchpad", "L2", "R2",
+	};
+	static const char* const kSteamDeck[PAD_SRC_COUNT] = {
+		"A", "B", "X", "Y", "View", "Steam", "Menu", "L3", "R3", "L1", "R1", "Up", "Down", "Left", "Right",
+		"...", "L4", "R4", "L5", "R5", "Touchpad", "L2", "R2",
+	};
+	init();
+	labels[0][0] = labels[1][0] = 0;
+	const bool keyboard = style == 0;
+	if (keyboard ? !g_nbind[C_SAVESTATE] : !g_npbind[C_SAVESTATE])
+		return 0;
+	const int bind = keyboard ? g_bind[C_SAVESTATE][0] : g_pbind[C_SAVESTATE][0];
+	const int parts[2] = { combo_first(bind), combo_second(bind) };
+	int n = 0;
+	for (int i = 0; i < 2 && parts[i] >= 0; i++, n++) {
+		const char* name = nullptr;
+		if (keyboard) {
+			for (size_t k = 0; k < sizeof kKeys / sizeof kKeys[0] && !name; k++)
+				if (kKeys[k].code == parts[i])
+					name = kKeys[k].name;
+		} else if (parts[i] < PAD_SRC_COUNT) {
+			name = (style == 2 ? kPlayStation : style == 3 ? kSteamDeck : kXbox)[parts[i]];
+		}
+		if (name)
+			snprintf(labels[i], 16, "%s", name);
+		else
+			snprintf(labels[i], 16, "#%d", parts[i]);
+	}
+	return n;
 }
 
 extern "C" BOOL PADInit()
@@ -818,7 +738,18 @@ extern "C" u32 PADRead(PADStatus* status)
 		memset(&status[i], 0, sizeof status[i]);
 		status[i].err = i == 0 ? PAD_ERR_NONE : PAD_ERR_NO_CONTROLLER;
 	}
-	if (GXPC_GameInputBlocked && GXPC_GameInputBlocked())
+	combo_masks();
+	const bool blocked = GXPC_GameInputBlocked && GXPC_GameInputBlocked();
+	// Port actions on their press, not while a menu has the input.
+	static bool wasSave, wasLoad;
+	const bool save = held(C_SAVESTATE), load = held(C_LOADSTATE);
+	if (save && !wasSave && !blocked)
+		port_savestate_hotkey(PORT_SAVESTATE_HOTKEY_SAVE);
+	if (load && !wasLoad && !blocked)
+		port_savestate_hotkey(PORT_SAVESTATE_HOTKEY_LOAD_NEWEST);
+	wasSave = save;
+	wasLoad = load;
+	if (blocked)
 		return PAD_CHAN0_BIT;
 	PADStatus& s = status[0];
 	u16 b        = 0;
@@ -846,36 +777,30 @@ extern "C" u32 PADRead(PADStatus* status)
 		b |= PAD_TRIGGER_L;
 	if (tr >= 250)
 		b |= PAD_TRIGGER_R;
-#ifdef _WIN32
-	// Native GameCube adapter report (see gcad above): buttons, sticks, triggers.
-	int gcx = 0, gcy = 0, gccx = 0, gccy = 0;
-	if (gcad::g_state.present && g_focused) {
-		int b1 = gcad::g_state.b1, b2 = gcad::g_state.b2;
-		if (b1 & 0x01) b |= PAD_BUTTON_A;
-		if (b1 & 0x02) b |= PAD_BUTTON_B;
-		if (b1 & 0x04) b |= PAD_BUTTON_X;
-		if (b1 & 0x08) b |= PAD_BUTTON_Y;
-		if (b1 & 0x10) b |= PAD_BUTTON_LEFT;
-		if (b1 & 0x20) b |= PAD_BUTTON_RIGHT;
-		if (b1 & 0x40) b |= PAD_BUTTON_DOWN;
-		if (b1 & 0x80) b |= PAD_BUTTON_UP;
-		if (b2 & 0x01) b |= PAD_BUTTON_START;
-		if (b2 & 0x02) b |= PAD_TRIGGER_Z;
-		if (b2 & 0x04) b |= PAD_TRIGGER_R;
-		if (b2 & 0x08) b |= PAD_TRIGGER_L;
-		int al = gcad::g_state.lt, ar = gcad::g_state.rt; // origin-corrected below by a fixed rest margin
+	// GameCube adapter (gc_adapter.cpp): buttons, sticks, triggers.
+	GcAdapterInput gc;
+	const bool haveGc = g_focused && gc_adapter_read(&gc);
+	if (haveGc) {
+		if (gc.b1 & 0x01) b |= PAD_BUTTON_A;
+		if (gc.b1 & 0x02) b |= PAD_BUTTON_B;
+		if (gc.b1 & 0x04) b |= PAD_BUTTON_X;
+		if (gc.b1 & 0x08) b |= PAD_BUTTON_Y;
+		if (gc.b1 & 0x10) b |= PAD_BUTTON_LEFT;
+		if (gc.b1 & 0x20) b |= PAD_BUTTON_RIGHT;
+		if (gc.b1 & 0x40) b |= PAD_BUTTON_DOWN;
+		if (gc.b1 & 0x80) b |= PAD_BUTTON_UP;
+		if (gc.b2 & 0x01) b |= PAD_BUTTON_START;
+		if (gc.b2 & 0x02) b |= PAD_TRIGGER_Z;
+		if (gc.b2 & 0x04) b |= PAD_TRIGGER_R;
+		if (gc.b2 & 0x08) b |= PAD_TRIGGER_L;
+		int al = gc.lt, ar = gc.rt; // less a fixed rest margin
 		al = al > 30 ? (al - 30) * 255 / 225 : 0;
 		ar = ar > 30 ? (ar - 30) * 255 / 225 : 0;
 		if (al > tl) tl = al;
 		if (ar > tr) tr = ar;
-		if (b2 & 0x08) tl = 255;
-		if (b2 & 0x04) tr = 255;
-		gcx  = gcad::g_state.lx;
-		gcy  = gcad::g_state.ly;
-		gccx = gcad::g_state.cx;
-		gccy = gcad::g_state.cy;
+		if (gc.b2 & 0x08) tl = 255;
+		if (gc.b2 & 0x04) tr = 255;
 	}
-#endif
 	s.triggerLeft  = (u8)tl;
 	s.triggerRight = (u8)tr;
 	s.analogA      = (b & PAD_BUTTON_A) ? 255 : 0;
@@ -896,10 +821,8 @@ extern "C" u32 PADRead(PADStatus* status)
 	int cx = held(C_CRIGHT) * 100 - held(C_CLEFT) * 100;
 	int cy = held(C_CUP) * 100 - held(C_CDOWN) * 100;
 	int pcx = axis8(g_axis[2], 100), pcy = axis8(-g_axis[3], 100);
-#ifdef _WIN32
-	if (gcx || gcy) { sx = gcx; sy = gcy; }
-	if (gccx || gccy) { pcx = gccx; pcy = gccy; }
-#endif
+	if (haveGc && (gc.lx || gc.ly)) { sx = gc.lx; sy = gc.ly; }
+	if (haveGc && (gc.cx || gc.cy)) { pcx = gc.cx; pcy = gc.cy; }
 	s.stickX    = (s8)(x ? x : sx);
 	s.stickY    = (s8)(y ? y : sy);
 	cx          = cx ? cx : pcx;

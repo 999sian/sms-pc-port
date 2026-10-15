@@ -108,8 +108,8 @@ if(TARGET SDL2::SDL2)
     target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_SDL2=1)
     target_link_libraries(sms_gx PUBLIC SDL2::SDL2)
     message(STATUS "sms_gx: SDL2 window support")
-    # The cheat menu (F9) in the window.
-    target_sources(sms_gx PRIVATE src/gx_cheat_menu.cpp)
+    # The cheat menu (F9), the warp menu (F8) and the save state messages in the window.
+    target_sources(sms_gx PRIVATE src/gx_cheat_menu.cpp src/gx_warp_menu.cpp src/gx_savestate_overlay.cpp)
 else()
     message(STATUS "sms_gx: SDL2 not found - no window support")
 endif()
@@ -143,8 +143,12 @@ if(SMS_GX_BUILD_TESTS)
     # x86, never x87 extended precision, and no contraction. Source file
     # properties are per directory, so the tests' copy needs its own.
     set(SMS_GX_MSL_MATH ${CMAKE_CURRENT_SOURCE_DIR}/../misc/msl_math.c)
-    # The cheat menu reads the port_cheat_* flags, which the port defines (platform/misc).
-    set(SMS_GX_PORT_CHEATS ${CMAKE_CURRENT_SOURCE_DIR}/../misc/port_cheats.cpp)
+    # The cheat menu reads the port_cheat_* flags and the warp menu the warp
+    # list, which the port defines (platform/misc).
+    set(SMS_GX_PORT_CHEATS ${CMAKE_CURRENT_SOURCE_DIR}/../misc/port_cheats.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../misc/port_warp.cpp)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/../misc/port_warp.cpp PROPERTIES
+        INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_include)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$" OR CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
         set(_sms_gx_msl_opts "-msse2;-mfpmath=sse;-ffp-contract=off")
     else()
@@ -191,6 +195,10 @@ if(SMS_GX_BUILD_TESTS)
     target_compile_features(gx_windowtest PRIVATE cxx_std_17)
     add_test(NAME gx_windowtest COMMAND gx_windowtest)
     if(TARGET SDL2::SDL2)
+        add_executable(gx_borderlesstest tests/gx_borderlesstest.cpp)
+        target_include_directories(gx_borderlesstest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_features(gx_borderlesstest PRIVATE cxx_std_17)
+        target_link_libraries(gx_borderlesstest PRIVATE SDL2::SDL2)
         add_executable(gx_windowsmoke tests/gx_windowtest.cpp ${SMS_GX_MSL_MATH} ${SMS_GX_PORT_CHEATS})
         target_include_directories(gx_windowsmoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_features(gx_windowsmoke PRIVATE cxx_std_17)

@@ -90,6 +90,7 @@ struct XMap {
 };
 static XMap s_xmap;
 static bool s_stretch2D = false;  // GXPC_SetStretch2D: the game's faders
+static bool s_wide2D = false;     // GXPC_SetWide2D: 2D the game laid out past the 4:3 edges (the map)
 // SMS_WIDESCREEN_HUD=edges: while the game draws its gameplay HUD
 // (GXPC_SetHud), a piece in the left third of the 4:3 frame goes to the left
 // edge of the wide one and one in the right third to the right edge; the
@@ -1650,13 +1651,15 @@ static void uploadUniforms(const ShaderProgram* sp, float texW[8], float texH[8]
         row1[1] = sext11((r1 >> 11) & 0x7FF) / 1024.0f;
         row0[2] = sext11(r2 & 0x7FF) / 1024.0f;
         row1[2] = sext11((r2 >> 11) & 0x7FF) / 1024.0f;
-        row0[3] = ldexpf(1.0f, sc);
+        row0[3] = float(sc);  // the scale's exponent: the shader shifts by it
         row1[3] = 0.0f;
     }
     UNI(uIndMtx, indmtx, im, glUniform4fv(sp->uIndMtx, 6, im));
 
     float efb[2] = {float(s_efbW), float(EFB_H)};
     UNI(uEfb, efb, efb, glUniform2fv(sp->uEfb, 1, efb));
+    float lw[1] = {float(g.bp[BP_LPSIZE] & 0xFF) / 6.0f};  // line programs: GXSetLineWidth's sixths of a pixel
+    UNI(uLineWidth, linewidth, lw, glUniform1fv(sp->uLineWidth, 1, lw));
     float proj[8] = {xff(XFR_PROJ), xff(XFR_PROJ + 1), xff(XFR_PROJ + 2), xff(XFR_PROJ + 3),
                      xff(XFR_PROJ + 4), xff(XFR_PROJ + 5), float(g.xfReg[XFR_PROJ + 6] & 1), 0.0f};
     UNI(uProj, proj, proj, glUniform4fv(sp->uProj, 2, proj));
@@ -1985,6 +1988,10 @@ static XMap drawXMap() {
         m.a = s_wide;
         return m;
     }
+    if (s_wide2D && (g.xfReg[XFR_PROJ + 6] & 1)) {  // laid out wide: the 4:3 scale, centred
+        m.b = float(s_ox);
+        return m;
+    }
     float sx = xff(XFR_VIEWPORT), cx = xff(XFR_VIEWPORT + 3) - 342.0f;
     bool fullWidth = fabsf(fabsf(sx) * 2.0f - float(EFB_W)) < 2.0f && fabsf(cx - float(EFB_W) / 2) < 2.0f;
     if (!fullWidth) {
@@ -2056,7 +2063,7 @@ void flushBatch() {
     GxTimer timer;
     GxTimer tf(&g_flushSeconds);
     s_xmap = drawXMap();
-    const ShaderProgram* sp = shaderForCurrentState();
+    const ShaderProgram* sp = shaderForCurrentState(false, s_bclass == PRIM_LINES);
     glcUseProgram(sp->prog);
     applyGlState();
 
@@ -2159,12 +2166,12 @@ void flushBatch() {
         }
     }
     if (s_pixActive && android::metricActive()) {
-        const ShaderProgram* metricSp = shaderForCurrentState(false, true);
+        const ShaderProgram* metricSp = shaderForCurrentState(false, s_bclass == PRIM_LINES, true);
         glcUseProgram(metricSp->prog);
         uploadUniforms(metricSp, texW, texH);
         const ShaderProgram* depthSp = nullptr;
         if (earlyFallback) {
-            depthSp = shaderForCurrentState(true);
+            depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
             glcUseProgram(depthSp->prog);
             uploadUniforms(depthSp, texW, texH);
         }
@@ -2213,7 +2220,7 @@ void flushBatch() {
     } else
     #endif
     if (earlyFallback) {
-        const ShaderProgram* depthSp = shaderForCurrentState(true);
+        const ShaderProgram* depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
         glcUseProgram(depthSp->prog);
         uploadUniforms(depthSp, texW, texH);
         GLboolean masks[4];
@@ -2334,11 +2341,12 @@ static GLuint efbReadFbo(int x0 = 0, int y0 = 0, int x1 = INT32_MAX, int y1 = IN
     return s_efbResolveFbo;
 }
 
-static void clearRect(int x, int y, int w, int h) {
+// x0 and x1: the scaled EFB's columns, as copyEfb works them out.
+static void clearRect(int x0, int x1, int y, int h) {
     uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
     glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(scaled(x), scaled(y), scaled(x + w) - scaled(x), scaled(y + h) - scaled(y));
+    glScissor(x0, scaled(y), x1 - x0, scaled(y + h) - scaled(y));
     bool hasAlpha = (g.bp[BP_PE_CONTROL] & 7) == 1;
     // Copy clears obey the PE write enables, just like ordinary EFB writes.
     // A copy clear in RGB8 must not overwrite the backing alpha used later by
@@ -2611,17 +2619,30 @@ static void copyEfb(uint32_t ctrl) {
     if (traceFile()) traceCopy(disp, x, y, w, h, dest, ctrl);
     // widescreen: a full-width copy takes the whole EFB, others the centred 4:3 part
     int gw = w;
+    bool stretched = false;
     if (s_efbW != EFB_W) {
         if (x <= 0 && x + w >= EFB_W) {
             x = 0;
             w = s_efbW;
         } else if (s_stretch2D) {  // a fader's pieces of the frame: stretched like its drawing
-            int r = int(float(x + w) * s_wide + 0.5f);
-            x = int(float(x) * s_wide + 0.5f);
-            w = r - x;
+            stretched = true;
         } else {
             x += s_ox;
         }
+    }
+    // its columns in the scaled EFB, and its left edge and width in EFB pixels
+    int x0 = scaled(x), x1 = scaled(x + w);
+    float fx = float(x), fw = float(w);
+    if (stretched) {
+        // A stretched piece's edges fall inside widened pixels, and its quad
+        // covers the scaled columns up to them, so the copy and its clear take
+        // those columns too. Taken to whole widened pixels, they went a column
+        // past the quad the circle wipe's blur draws its centre cell back with,
+        // which left a black line down the opening iris above 1x.
+        x0 = int(lroundf(float(x) * s_wide * s_scale));
+        x1 = int(lroundf(float(x + w) * s_wide * s_scale));
+        fx = float(x0) / s_scale;
+        fw = float(x1 - x0) / s_scale;
     }
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
@@ -2634,7 +2655,7 @@ static void copyEfb(uint32_t ctrl) {
 
     if (disp) {
         Xfb& xfb = s_xfbs[dest];
-        const int x0 = scaled(x), y0 = scaled(y), sw = scaled(x + w) - x0, sh = scaled(y + h) - y0;
+        const int y0 = scaled(y), sw = x1 - x0, sh = scaled(y + h) - y0;
         if (!xfb.tex || xfb.w != sw || xfb.h != sh) {
             if (!xfb.tex) glGenTextures(1, &xfb.tex);
             glBindTexture(GL_TEXTURE_2D, xfb.tex);
@@ -2655,7 +2676,7 @@ static void copyEfb(uint32_t ctrl) {
         bool intensity = ((ctrl >> 15) & 3) == 3;
         bool zcopy = (g.bp[BP_PE_CONTROL] & 7) == 3;
         bool half = (ctrl >> 9) & 1;
-        int ow = scaled(x + w) - scaled(x), oh = scaled(y + h) - scaled(y);
+        int ow = x1 - x0, oh = scaled(y + h) - scaled(y);
         if (half) {
             ow /= 2;
             oh /= 2;
@@ -2675,7 +2696,7 @@ static void copyEfb(uint32_t ctrl) {
         uint32_t mode = fmt | (intensity ? 16u : 0u) | (zcopy ? 32u : 0u);
         efbCopyRegister(dest, tex, ow, oh, mode);
         // s_efbColor (s_efbDepth for depth copies), sampled below, holds the current EFB
-        efbReadFbo(scaled(x), scaled(y), scaled(x + w), scaled(y + h), zcopy ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT);
+        efbReadFbo(x0, scaled(y), x1, scaled(y + h), zcopy ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT);
         glBindFramebuffer(GL_FRAMEBUFFER, s_tmpFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
         glViewport(0, 0, ow, oh);
@@ -2684,7 +2705,7 @@ static void copyEfb(uint32_t ctrl) {
         glBindTexture(GL_TEXTURE_2D, s_efbDepth);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_efbColor);
-        float rect[4] = {float(x) / float(s_efbW), float(y) / EFB_H, float(w) / float(s_efbW), float(h) / EFB_H};
+        float rect[4] = {fx / float(s_efbW), float(y) / EFB_H, fw / float(s_efbW), float(h) / EFB_H};
         glUniform4fv(s_copyURect, 1, rect);
         glUniform1i(s_copyUMode, GLint(mode));
         glUniform1i(s_copyUAlphaOne, (g.bp[BP_PE_CONTROL] & 7) != 1);
@@ -2694,7 +2715,7 @@ static void copyEfb(uint32_t ctrl) {
         s_stats.efbCopies++;
         writeBackCopy(dest, tex, ow, oh, tw, th, copyLayout(fmt, zcopy));
     }
-    if (clear) clearRect(x, y, w, h);
+    if (clear) clearRect(x0, x1, y, h);
     glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
     if (clear) s_drawGen++;
     if (disp) {
@@ -3339,6 +3360,12 @@ void GXPC_SetStretch2D(int on) {
     s_stretch2D = on != 0;
 }
 
+void GXPC_SetWide2D(int on) {
+    if (s_efbW == EFB_W || s_wide2D == (on != 0)) return;
+    flushBatch();
+    s_wide2D = on != 0;
+}
+
 void GXPC_SetWidescreen(float widthOver43) {
     if (s_ready) return;  // the EFB size is fixed once it exists
     s_wide = widthOver43 > 1.0f ? widthOver43 : 1.0f;
@@ -3376,6 +3403,37 @@ void GXPC_DrawOverlay(const uint8_t* rgba, int w, int h, int x, int y, int scale
 }
 
 }  // extern "C"
+
+// SMS_WINDOW_SHOTS=frame,frame,...: the window as it is shown, with the menus
+// drawn over the game, at those GX frames (GXPC_FrameCount), written to
+// SMS_SHOT_DIR (default "shots") as window<frame>.ppm. The XFB captures
+// (SMS_SHOTS) have the game's picture only.
+void gx::captureWindow(uint32_t frame, int w, int h) {
+    static std::vector<uint32_t> frames;
+    static bool parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char* e = getenv("SMS_WINDOW_SHOTS"))
+            for (const char* p = e; *p;) {
+                frames.push_back(uint32_t(strtoul(p, const_cast<char**>(&p), 10)));
+                while (*p == ',' || *p == ' ') p++;
+            }
+    }
+    if (w <= 0 || h <= 0 || std::find(frames.begin(), frames.end(), frame) == frames.end()) return;
+    std::vector<uint8_t> px(size_t(w) * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const char* dir = getenv("SMS_SHOT_DIR");
+    char path[1024];
+    snprintf(path, sizeof path, "%s/window%05u.ppm", dir ? dir : "shots", frame);
+    if (FILE* f = fopen(path, "wb")) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--)  // GL's rows go bottom up
+            for (int x = 0; x < w; x++) fwrite(&px[(size_t(y) * w + x) * 4], 1, 3, f);
+        fclose(f);
+        fprintf(stderr, "[sms_gx] captured the window at frame %u -> %s\n", frame, path);
+    }
+}
 
 void gx::drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH) {
     if (!s_ready || w <= 0 || h <= 0) return;

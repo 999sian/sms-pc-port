@@ -217,6 +217,8 @@ def be_reads(path, rx, repl):
 
 
 ECLIPSE_BE_FIXES = [
+    be_reads("src/object/star_bit.cpp", r"in\.read\(&colorIdx, sizeof\(int\)\)",
+             r"in.readBE(&colorIdx, sizeof(int))"),
     be_reads("src/object/tornado_obj.cpp", r"stream\.read\(&mBlowStrength, 4\)", r"stream.readBE(&mBlowStrength, 4)"),
     be_reads("src/object/blow_wind_obj.cpp",
              r"stream\.read\(&(mStrength|mMode), (sizeof\((?:f32|TBlowWindMapObj::GradientMode)\))\)",
@@ -293,6 +295,20 @@ ASPECT_RATIO_FIXES = [
 ]
 
 ECLIPSE_FIXES = optional(TEXTURE_FIXES) + CARD_IMAGE_FIXES + PARTICLE_FIXES + DEBS_FIXES + [RAWDATA_FIX, RAWDATA_REGION_FIX] + BOOL_RET_FIXES + ECLIPSE_BE_FIXES + ECLIPSE_PATCH_TYPE_FIXES + [
+    # Six four-byte colours are six entries, not 24. Clamp's upper bound
+    # is inclusive, so it must name the last colour rather than the count.
+    ("src/object/star_bit.cpp", r"rand\(\) % sizeof\(sStarBitColorArray\)",
+     "rand() % (sizeof(sStarBitColorArray) / sizeof(sStarBitColorArray[0]))",
+     "Star Bits choose among colour entries, not bytes"),
+    ("include/object/star_bit.hxx", r"Clamp\(index, 0, sizeof\(sStarBitColorArray\)\)",
+     "Clamp(index, 0, static_cast<int>(sizeof(sStarBitColorArray) / sizeof(sStarBitColorArray[0])) - 1)",
+     "Star Bit colour indices stop at the last entry"),
+    # The final Bowser arena's iron crates create an intact and a broken
+    # model. A one-entry keeper writes both its actor pointer and model index
+    # past their arrays, corrupting the neighbouring model before calc().
+    ("src/object/iron_crate.cpp", r"new TMActorKeeper\(mLiveManager, 1\)",
+     "new TMActorKeeper(mLiveManager, 2)",
+     "iron crates reserve both intact and broken model slots"),
     # A retail function taking TVec3f references, called through a (...) cast:
     # on the GameCube an aggregate in a variable argument list is passed by
     # address, so the callee's references see the objects. Pass the addresses.
@@ -321,6 +337,24 @@ ECLIPSE_FIXES = optional(TEXTURE_FIXES) + CARD_IMAGE_FIXES + PARTICLE_FIXES + DE
      "Eclipse's settings group knows its module"),
 ]
 BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDATA_FIX, RAWDATA_REGION_FIX] + BSE_BE_FIXES + PATCH_TYPE_FIXES + [
+    # J2DTextBox owns and deletes its string. The setting label and shadow
+    # cannot share a heap buffer; keep independent 100-byte allocations and
+    # mirror edits into the shadow so it still displays the current value.
+    ("src/settings.cpp", r"settingText->mStrPtr\s*= settingTextBuf;",
+     "delete[] settingText->mStrPtr;\n                settingText->mStrPtr = settingTextBuf;",
+     "settings labels release their initial owned string"),
+    ("src/settings.cpp", r"settingTextBehind->mStrPtr\s*= settingTextBuf;",
+     "delete[] settingTextBehind->mStrPtr;\n"
+     "                settingTextBehind->mStrPtr = new char[100];\n"
+     "                memcpy(settingTextBehind->mStrPtr, settingTextBuf, 100);",
+     "settings shadows own a separate string"),
+    ("src/p_settings.hxx",
+     r"(?m)^([ \t]*)(snprintf\(mCurrentSettingInfo->mSettingTextBox->mStrPtr, 100, \"%s: %s\",\s*"
+     r"mCurrentSettingInfo->mSettingData->getName\(\), valueTextBuf\);)",
+     lambda m: m.group(1) + m.group(2) + "\n" + m.group(1)
+     + "memcpy(mCurrentSettingInfo->mSettingTextBoxBack->mStrPtr,\n" + m.group(1)
+     + "       mCurrentSettingInfo->mSettingTextBox->mStrPtr, 100);",
+     "settings edits update the independently owned shadow string"),
     # BSE's free-fly camera, in place of CPolarSubCamera::perform's test of
     # TGraphics' first-tick flag (bit 0 of the u16 at 0, `lhz`), reads the
     # word's low byte, the GameCube's second; natively that is the high byte,
@@ -532,6 +566,22 @@ SHI_FIXES = BOOL_RET_FIXES + SHI_WORD_FIXES + SHI_GAME_TYPES + [
      + "".join("extern template void TParamT<%s>::load(JSUMemoryInputStream &);\n" % t
                for t in ("u8", "s16", "u16", "s32", "f32", "JGeometry::TVec3<f32>")),
      "the game's TParamT loads convert .prm values"),
+    # A bool .prm value is a byte the mods' code tests against zero on the
+    # console (BSE's canCollectFluddItem_: lbz, cmplwi 0), and Eclipse's
+    # luigi.szs better_sms.prm stores mCanUseFludd as 2. Read raw into a
+    # bool, clang on x86 takes 2 for neither true nor false: !mCanUseFludd
+    # came out true, so Luigi could not take a nozzle from a box. Stored as
+    # 0 or 1 here, every reader sees what the console's code did.
+    ("include/SMS/System/Params.hxx",
+     r"(\nextern template void TParamT<JGeometry::TVec3<f32>>::load\(JSUMemoryInputStream &\);\n)",
+     r"\1template <> inline void TParamT<bool>::load(JSUMemoryInputStream &stream) {\n"
+     r"    u32 buffer;\n"
+     r"    stream.read(&buffer, 4);\n"
+     r"    u8 value;\n"
+     r"    stream.read(&value, 1);\n"
+     r"    mValue = value != 0;\n"
+     r"}\n",
+     ".prm bools are any nonzero byte, as the console's code tests them"),
 ]
 
 

@@ -11,6 +11,7 @@ Nothing in this folder is needed to play, and git ignores everything in it but t
 python3 tools/mods/get.py textures    # the UHD texture pack, into mods/textures/GMS, and the extras
 python3 tools/mods/get.py extras      # only the extras, into mods/textures/sms-hd-texture-extras
 python3 tools/mods/get.py eclipse     # Super Mario Eclipse, patched from your disc, into mods/eclipse
+python3 tools/mods/get.py language fr  # the French language pack, into mods/languages/fr (de, es, it, pl)
 python3 tools/mods/get.py all
 ```
 
@@ -26,7 +27,9 @@ Eclipse is about 850 MB to download; it is an xdelta patch that turns your own N
 Texture packs made for Dolphin's "Load Custom Textures" work unchanged.
 Unpack one into `mods/textures/` (or let `get.py textures` install the UHD pack), for example the [Super Mario Sunshine UHD Texture Pack](https://github.com/qashto/Super_Mario_Sunshine_UHD_Texture_Pack) (from its `GMS.7z` release, `GMS/Textures/GMS` goes to `mods/textures/GMS`).
 Every `tex1_*.png` and `tex1_*.dds` below `mods/textures/` is used, in any sub-folder; several packs can sit side by side.
+The one exception is a folder named `widescreen_stars_fix`: the UHD pack's blanks the star particle of Mario's wall bonk and a stunned Cataquack, to hide stars Dolphin's widescreen hack shows, which the port's widescreen does not.
 DDS files can hold BC1–BC3 or BC7 blocks or plain RGBA. Supported blocks stay compressed, including files with only one or a few mipmap levels: the missing levels are made from the last one in the background after the level loads and compressed in the same format, so far-away surfaces do not shimmer (until they arrive, about a second of four cores for an 8192×8192 image, sampling stops at the file's last level). A GPU that cannot sample BC7 (macOS) gets them decoded instead.
+A cut-out (a fence, grate or leaf, with alpha mostly clear or opaque) replacing a mipmapped texture keeps its coverage in the levels made for it: as much of each passes the alpha test as in the file's last level, or in the game's own level of that size if more, and its colours are weighted by alpha. Plain averaging thins such strands until they vanish a few metres away (Pinna Park's climbing cage) and darkens them with the clear texels' colour.
 The missing levels are made at the lowest processor and disk priority, so they use idle time rather than slowing the game, and are kept in the cache folder (`texture-mips/` in `~/.cache/sms-port`, `~/Library/Caches/sms-port` on macOS, `%LOCALAPPDATA%\sms-port` on Windows; the UHD pack's come to about 1 GB once every level has been seen), so each is made once. A cached file is used only while its source keeps the size and date it was made from. `SMS_TEXTURE_PACK_CACHE=dir` keeps them elsewhere; `=0` makes them every session instead.
 
 A pack names each image after the texture it replaces (its size, format and a hash of its data), so it matches the game's own textures wherever they are loaded.
@@ -52,3 +55,12 @@ The log names each mod and how many files it replaced and added.
 
 This covers mods that only change data.
 Mods that also change the game's code, such as Super Mario Eclipse, need that code ported too; see [docs/ECLIPSE.md](../docs/ECLIPSE.md).
+
+## languages/: language packs
+
+`language = <code>` in `settings.txt` (`SMS_LANGUAGE`) plays the game in that language with the pack in `languages/<code>/`: `fr`, `de`, `es`, `it` or `pl`; `en`, the default, is the disc's own English.
+`get.py language <code>` installs one; its release is pinned in `tools/mods/language-packs.json`, and `--if-outdated` downloads only when the installed one (recorded in `languages/<code>/.release`) is not that release.
+
+A pack's `files/` is laid out like a game file mod's, with one addition: a folder named after one of the disc's archives holds files that replace the ones of the same path inside that archive (`files/data/scene/bianco0.szs/map/message.bmg`).
+The port rebuilds such an archive when the game opens it, so a pack holds only what changes.
+Mods named with `mod` are applied after the language pack: a mod's own copy of an archive wins over the language's files inside it.

@@ -30,6 +30,7 @@ PFNGLSAMPLERPARAMETERFPROC samplerParameter;
 PFNGLBINDSAMPLERPROC bindSampler;
 PFNGLCOLORMASKPROC colorMask;
 bool clipDistance, depthClamp, logicEnabled, metricOn;
+const char* geometryExtension;  // the geometry shader extension, or null
 bool colourWrites = true;  // any of glColorMask's four
 GLenum logic = GL_COPY;
 GLuint program, logicTexture;
@@ -234,6 +235,7 @@ void replace(std::string& s, const std::string& from, const std::string& to) {
 }
 
 bool metricActive() { return metricOn; }
+bool geometryShaders() { return geometryExtension != nullptr; }
 void memoryBarrier(unsigned bits) { entry<PFNGLMEMORYBARRIERPROC>("glMemoryBarrier")(GLbitfield(bits)); }
 bool needsRebasedIndices() { return drawBase == rebaseDraw; }
 IndexRange::IndexRange(size_t sourceOffset, int count, int sourceBase, unsigned buffer, const uint32_t* src)
@@ -278,6 +280,10 @@ void install(void* (*getProc)(const char*)) {
     queryResult = glGetQueryObjectuiv; deleteQueries = glDeleteQueries;
     clipDistance = has("GL_EXT_clip_cull_distance");
     depthClamp = has("GL_EXT_depth_clamp");
+    // Shaders stay GLSL ES 3.10, as every shader of a program must have the
+    // same version, so a geometry shader needs the extension even on 3.2.
+    geometryExtension = has("GL_EXT_geometry_shader") ? "GL_EXT_geometry_shader"
+                        : has("GL_OES_geometry_shader") ? "GL_OES_geometry_shader" : nullptr;
     gx::gl::gx_glEnable = enableAdapter; gx::gl::gx_glDisable = disableAdapter;
     gx::gl::gx_glGetIntegerv = integerAdapter; gx::gl::gx_glUseProgram = programAdapter;
     gx::gl::gx_glDeleteProgram = deleteProgramAdapter; gx::gl::gx_glLinkProgram = linkProgramAdapter;
@@ -293,14 +299,18 @@ void install(void* (*getProc)(const char*)) {
     gx::gl::gx_glGetQueryObjectuiv = queryAdapter; gx::gl::gx_glDeleteQueries = deleteAdapter;
     if (drawBase == rebaseDraw || !has("GL_EXT_buffer_storage")) gx::gl::gx_glBufferStorage = nullptr;
     else gx::gl::gx_glBufferStorage = entry<PFNGLBUFFERSTORAGEPROC>("glBufferStorageEXT");
-    logmsg("Android GLES: clip distances %s, depth clamp %s", clipDistance ? "yes" : "no", depthClamp ? "yes" : "no");
+    logmsg("Android GLES: clip distances %s, depth clamp %s, geometry shaders %s", clipDistance ? "yes" : "no",
+           depthClamp ? "yes" : "no", geometryExtension ? "yes" : "no");
 }
 
 std::string shaderSource(const std::string& source, unsigned type) {
     std::string s = source;
     const bool gxClip = s.find("gl_ClipDistance[0] = clip.z") != std::string::npos;
     std::string header = "#version 310 es\n";
-    if (type == GL_VERTEX_SHADER && clipDistance && s.find("gl_ClipDistance") != std::string::npos)
+    if (type == GL_GEOMETRY_SHADER && geometryExtension)
+        header += std::string("#extension ") + geometryExtension + " : require\n";
+    if ((type == GL_VERTEX_SHADER || type == GL_GEOMETRY_SHADER) && clipDistance &&
+        s.find("gl_ClipDistance") != std::string::npos)
         header += "#extension GL_EXT_clip_cull_distance : require\n";
     header += "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\n";
     // EXT_clip_cull_distance predeclares this built-in array. Our constant
@@ -309,7 +319,12 @@ std::string shaderSource(const std::string& source, unsigned type) {
     // Keep the extension and writes; do not disable the game's clip planes.
     replace(s, "#version 330 core\n", header);
     replace(s, "#extension GL_ARB_shader_image_load_store : require\n", "");
-    if (type == GL_VERTEX_SHADER) {
+    if (type == GL_GEOMETRY_SHADER) {
+        // without clip distances the vertex shader writes none to pass on
+        if (!clipDistance)
+            for (size_t at; (at = s.find("  gl_ClipDistance[")) != std::string::npos;)
+                s.erase(at, s.find('\n', at) + 1 - at);
+    } else if (type == GL_VERTEX_SHADER) {
         if (!clipDistance) {
             replace(s, "  gl_ClipDistance[0] = clip.z + clip.w;\n  gl_ClipDistance[1] = -clip.z;\n", "");
             replace(s, "  gl_ClipDistance[0] = 1.0;\n  gl_ClipDistance[1] = 1.0;\n", "");
