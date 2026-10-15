@@ -227,12 +227,19 @@ void textureCpuWrote(const void* p, uint32_t size);
 uint32_t copyLayout(uint32_t copyFmt, bool z);
 uint32_t encodeTexture(const uint8_t* rgba, uint32_t fmt, uint32_t w, uint32_t h, uint8_t* dst);
 uint32_t texLevelBytes(uint32_t fmt, uint32_t w, uint32_t h);
+void decodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h, const uint8_t* tlut, uint32_t tlutFmt,
+                   uint8_t* out);
 // Texture packs (gx_hires.cpp)
 bool hiresEnabled();
 bool hiresLog();
 std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped, const uint8_t* tlut,
                       uint32_t tlutBytes, bool onlyIfPresent);
 unsigned hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale);
+// The share of a decoded level's texels (RGBA8) at or above alpha 128.
+float alphaCoverage(const uint8_t* rgba, size_t texels);
+// Before a replacement is asked for: alphaCoverage of each of its original's
+// levels, level 0 first, which the levels made for it follow (completeChain).
+void hiresNoteOriginal(const std::string& name, std::vector<float> coverage);
 void hiresShutdown();
 const char* hiresDumpDir();  // SMS_TEXTURE_DUMP, or null
 void hiresDump(const std::string& name, const uint8_t* rgba, uint32_t w, uint32_t h);
@@ -266,24 +273,37 @@ struct UniformCache {
     bool init;
     int tevreg[16], konst[16], alpharef[2];
     float texscale[16], texsize[16], fog[4], fogcolor[4], indmtx[24], efb[2], proj[8], vp[8], ambmat[16];
+    float linewidth[1];
 };
 struct ShaderProgram {
     unsigned prog;
     int id;  // creation order; SMS_GX_DUMP_SHADERS=dir writes dir/prog<id>.vs/.fs
     int uTevReg, uKonst, uTexScale, uAlphaRef, uFog, uFogColor, uIndMtx, uTexSize, uEfb,
-        uProj, uViewport, uAmbMat, uDstAlpha;
+        uProj, uViewport, uAmbMat, uDstAlpha, uLineWidth;
     mutable UniformCache uc;
 };
 bool shaderHasEarlyFragmentTests();
 bool earlyZWritesRejected();
-const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool metric = false);
+// `lines`: the program for a line batch, which draws each line as a quad
+// GXSetLineWidth wide (a geometry shader); `metric`: Android's pixel-metric
+// variant, which counts into a storage buffer
+const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool lines = false, bool metric = false);
 void shaderPrepareStage(int stage);  // while a stage loads: its programs (the warm-up)
 
 // ---------------------------------------------------------------- overlay panels
 // Each slot keeps its own texture, so panels drawn in the same frame keep their
 // cached bitmaps. GXPC_DrawOverlay draws the debug overlay's slot.
-enum OverlaySlot { OVERLAY_DEBUG, OVERLAY_CHEAT_MENU, OVERLAY_SLOTS };
+enum OverlaySlot {
+    OVERLAY_DEBUG,
+    OVERLAY_CHEAT_MENU,
+    OVERLAY_WARP_MENU,
+    OVERLAY_STATE_MENU,
+    OVERLAY_STATE_TOAST,
+    OVERLAY_SLOTS
+};
 void drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH);
+// SMS_WINDOW_SHOTS: the window as shown, menus included, at GX frame `frame` (GL thread, before the swap).
+void captureWindow(uint32_t frame, int w, int h);
 // Panel bitmaps (gx_overlay.cpp): RGBA8, w x h, row 0 at the top. Text shares
 // one scratch buffer, so panels are rasterised on the GL thread only.
 void overlayFillRect(std::vector<uint8_t>& px, int w, int h, int x0, int y0, int x1, int y1, const uint8_t c[4]);

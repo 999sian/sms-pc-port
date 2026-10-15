@@ -685,11 +685,13 @@ unsigned bindTextureMap(int map, float* outW, float* outH) {
         uint32_t lw = w, lh = h;
         uint32_t pw = w, ph = h;
         float mipDiff = 0.0f;
+        std::vector<float> coverage;  // for the replacement's levels (hiresNoteOriginal)
         for (uint32_t l = 0; l < levels; l++) {
             s_decodeBuf.resize(size_t(lw) * lh * 4);
             decodeTexture(src, fmt, lw, lh, tlut, (tlutReg >> 10) & 3, s_decodeBuf.data());
             glTexImage2D(GL_TEXTURE_2D, GLint(l), GL_RGBA8, GLsizei(lw), GLsizei(lh), 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          s_decodeBuf.data());
+            if (!e.hires.empty()) coverage.push_back(alphaCoverage(s_decodeBuf.data(), size_t(lw) * lh));
             if (l > 0) mipDiff += mipLevelDiff(s_prevLevelBuf.data(), pw, ph, s_decodeBuf.data(), lw, lh);
             s_prevLevelBuf.swap(s_decodeBuf);
             pw = lw;
@@ -699,6 +701,7 @@ unsigned bindTextureMap(int map, float* outW, float* outH) {
             lh = lh > 1 ? lh / 2 : 1;
         }
         e.arbitraryMips = levels > 1 && mipDiff / float(levels - 1) > kArbitraryMipThreshold;
+        hiresNoteOriginal(e.hires, std::move(coverage));
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, GLint(levels - 1));
     }

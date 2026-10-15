@@ -112,6 +112,7 @@ gdb -q -batch -nx -ex 'set debuginfod enabled off' \
 
 | Module | What it does |
 | --- | --- |
+| `platform/savestate/` | Save states ([SAVE-STATES.md](SAVE-STATES.md)): the state file and its compression (`state_file.cpp`, tested by `tests/`), saving and loading the game's memory, and the requests between the controls, the state menu the game draws in its pause menu (`src/savestate_menu.cpp`) and the game (patches `zzzz-savestate-*`); `platform/gx/src/gx_savestate_overlay.cpp` shows the saved/loaded messages and takes the pictures. |
 | `platform/sdk_stubs.cpp` | Generated: a weak, logging stub for all 321 SDK functions in `api-surface.tsv` that are not header inlines/macros; real implementations override them. |
 | `platform/port_runtime.cpp` | Boot: emulated MEM1 (24 MiB) mapped at `0x80000000`, game source selection, GLX vendor choice, crash handler. |
 | `platform/os/` | One emulated CPU: every `OSThread` is a host thread, only the CPU owner runs, strict priorities; message queues, mutexes, conds; interrupts delivered at OS-call check points and on idle; arena, clocks, OSAlloc, stopwatches, cache ops (→ `GXPC_InvalidateRange`). |
@@ -154,6 +155,8 @@ Each file in `decomp-patches/` starts with a `Reason:` line; they are applied in
 | 0021–0022 | Host integer types for clang (g++ `-fpermissive` only warns): `ARQCallback` takes `uintptr_t` like the callbacks passed to it (`JKRAramPiece::doneDMA`, JASystem's `aramDmaFinish`), and the four `fireStartDemoCamera` callbacks still spelled with `u32` take `uintptr_t` as `MarDirector.hpp` declares. |
 | `endian-01..16` | Loader-site byte-order fixes (JPA, J2D BLO, BMG, JUTColor, PRM, SPC, streams, DL vertex counts, sequences, card saves, THP headers, J3DSkinDeform/J3DCluster display lists, the plaza shine-shadow sphere, the HUD/map 2D archive swap); see `platform/endian/README.md`. |
 | `port-02` | `SMS_WARP` / `SMS_WARP_MOVIE`: debug warp or movie from a file-select load. |
+| `port-09` | Hides the small grey placeholder cubes in coro_ex0, the Bianco Hills secret course ("The Secret of the Dirty Lake"): `TMapModel::initJointModel` sets the skip flag on the map's `_o17` shape, found by its material and `B_CoronaEX0_1` texture names, so Super Mario Eclipse's copy of the course loses them too. |
+| `zzz-warp-01` | The warp menu (F8 or a controller's Back/Select with the debug overlay open, `platform/gx/src/gx_warp_menu.cpp`): `TApplication::gameLoop` lists every episode whose scene is on the disc, named from `stagename.bmg` and `scenarioname.bmg` as the pause menu names them (a code mod may name them its own way, `port_warp_scenario_name_id`), and starts the warp picked with `TMarDirector::setNextStage`. |
 | `zzz-presence-01` | `SMS_PRESENCE`: `TApplication::gameLoop` hands the area, episode, Shine and blue coin counts, lives and pause state to `platform/presence` once a frame, for the launcher's Discord Rich Presence. |
 | `audio-01..02` | JAudio bitfield/byte-order fixes (`TChannel` mix config, BMS note-on flags); see `platform/audio/README.md`. |
 | `ret-02..03` | Explicit returns for the 34 functions that fall off the end of a non-void body and whose value nothing reads (undefined behaviour under g++, harmless under MWCC). |
@@ -163,7 +166,9 @@ Each file in `decomp-patches/` starts with a `Reason:` line; they are applied in
 | `fpu-02..04` | MWCC's float-to-unsigned conversions at every site where the DOL makes them, with the runtime's result (`port_cvt_fp2unsigned` and `port_cvt_dbl_usll` in `port_fpu.h`: 0 below zero and for NaN, 0xFFFFFFFF from 2^32 up): the hit-check table index and the iris wipe's first row (`fpu-02..03`), and the 37 other source sites (`fpu-04`; `TMarDirector`'s wipe fade is in `framerate-35`). See [Float-to-integer conversions](#float-to-integer-conversions). |
 | `fpu-07` | `OSf32tos8` (`JASTrack`'s two calls) stores through GQR4 as the Gekko does, saturated to -128..127 and converted towards zero (`port_gekko_quantize` in `port_fpu.h`); the inline had no host body. See [64-BIT.md](64-BIT.md), item 18. |
 | `bounds-01..04` | Retail out-of-bounds accesses whose result depends on byte order or data layout, given the console's result: `TGCConsole2`'s unset pane index, the two 16-byte null textures read as 32, NPC colour indices past their tables, an archive root's `..` (`JKRArchive` lookups find nothing, as the console's reading of the bytes before the directory table does). |
-| `uninit-01..03` | Retail reads of uninitialised stack values made deterministic: the stack light objects' direction, the logo wipe's pen vector z, the plaza tightrope colour. |
+| `bounds-07` | The event watcher's `*4LiveActor` commands set or read `TLiveActor` fields only on real `TLiveActor`s: Super Mario Eclipse's Red Lily switch script names map statics, and the live-flag write past them hit the next object's model pointer. |
+| `perf-01` | The wipe that opens and closes the map (`Hx_Test5`) copied the frame in 64x64 cells, about 80 EFB copies a frame, each a render-pass switch and a write-back on the PC; it copies all its cells at once and draws each cell's fan from its part of that copy, the same picture (at 4:3, within a level of rounding; in widescreen the cells no longer round their stretched edges one by one). |
+| `uninit-01..03`, `uninit-05` | Retail reads of uninitialised stack values made deterministic: the stack light objects' direction, the logo wipe's pen vector z, the plaza tightrope colour, the split Phantamanta's heading. |
 
 ## Memory and undefined-behaviour checks
 
@@ -190,6 +195,7 @@ Last audit 2026-09-30, on the scripted title and plaza runs (no stage sweep).
   - Scene data can give an NPC a body or cloth colour index past the end of its `NpcInitData` table, and `SMS_InitChangeNpcColor` reads the entry regardless: the console reads the next bytes of that file's `.rodata`, the port whatever its own layout puts there, which differs between the word sizes.
     `SMSPortNpcColorEntry` returns retail's bytes for every such entry a scene uses (`bounds-03`): Super Mario Eclipse's Yoshi village Yoshis and other Piantas (see [ECLIPSE.md](ECLIPSE.md)), and Nintendo's `test11`, the only one on the retail disc.
   - `Hxs_PenDraw` normalises a vector with an unset z (`-2e-19` and similar in the 32-bit build, 0 in the 64-bit one); it is now 0 (`uninit-02`).
+  - `TBossMantaManager::spawn` adds a matrix's unset translation column to each new Phantamanta's heading. Retail reads a saved FPR (`f26`) that no game code on that call path writes. On macOS that stack slot held a NaN at the Phantamanta's first split in Sirena Beach, which sent the new mantas to NaN positions. `TMapCollisionData::checkGround` then turned those into `INT_MIN` grid indices and faulted on a 64-bit host. The translation is now zero, so the heading is the rotation alone (`uninit-05`).
 - **Real, left as they are** (the port reads what the console reads, or the value does not matter):
   - Uninitialised members read from never-written arena memory, 0 on both the console (MEM1 is zeroed at boot) and the port: `JUTGamePad::CRumble` reads the pad's port number before the constructor sets it; `MSModBgm::unk0`, `TOptionControl::mSelectedOption`, `TMario::mFreezeImmunityTimer`, `TSpcInterp`'s lock flag, `TConsoleStr::unk2A5`, `J3DMatPacket::mpShapePacket` and joints' scale flags that `J3DModel::calcNrmMtx` reads before anything computes them.
   - `TMarDirector::direct`'s movement-pass `JDrama::TGraphics` is never initialised, so `setViewport` tests garbage `field_rendering`; the draw pass sets the viewport again.
@@ -240,14 +246,17 @@ The everyday options are in the [README](../README.md#options); this is the full
 | `SMS_ARCH=32\|64` | which build `build.sh` and `run.sh` use (see [BUILD.md](../BUILD.md)) |
 | `SMS_DISC_IMAGE`, `SMS_DISC_ROOT` | game source (image file, or extracted `files/` folder); either, or a disc argument, overrides files bundled into the executable |
 | `SMS_SAVE_DIR` | memory card directory |
+| `SMS_SAVE_STATE_DIR` | save state directory (default: `savestates` beside the memory card directory; [SAVE-STATES.md](SAVE-STATES.md)) |
 | `SMS_HEADLESS=1` / `--headless` | no window (offscreen EGL; Linux only) |
 | `SMS_BINDINGS` | key bindings file (default `./bindings.txt`, then `../../bindings.txt` when started from `build/<os>-<arch>/`) |
 | `SMS_AUDIO=0` | no sound output; the game's audio (JAudio's thread and sequencer, the software DSP) still runs, paced as with no output device ([64-BIT.md](64-BIT.md), item 19) |
 | `SMS_NO_AUDIO=1` | run with an empty JAudio configuration and an idle AI DMA; THP movies stall (their video waits for audio), so combine with `SMS_SKIP_MOVIES=1` |
 | `SMS_SKIP_MOVIES=1` | skip cutscenes; keep the plaza portals' looping movies |
 | `SMS_WARP=stage,scenario[,shines]` | debugging: loading a file goes to that area instead (`1,0,1` is Delfino Plaza right after the airstrip), optionally with that Shine count |
+| `SMS_WARP_LIST=1` | print the warp menu's list (`area,episode` as `SMS_WARP` takes them, the stage, the episode and its scene) when the menu first opens |
 | `SMS_WARP_MOVIE=n` | debugging: loading a file plays streaming movie `n` (0–19, `TMovieDirector::getStreamMovieName`) |
 | `SMS_SHOTS=f,f,...`, `SMS_SHOT_DIR` | capture the XFB at these fields (retail numbering) as PPM; `tools/shots.py` converts them into `build/shots/` and compares with retail |
+| `SMS_WINDOW_SHOTS=n,n,...` | capture the window as shown, with the port's menus over the game, at these GX frames (`GXPC_FrameCount`) as `SMS_SHOT_DIR/window<n>.ppm` (needs a window, not `SMS_HEADLESS`) |
 | `SMS_AUTOPRESS=control@field[+hold],...` | scripted input (e.g. `start@1400+20,stick_left@3300+40,a@3500+30`); in a window it is injected as SDL key events, i.e. through the keyboard path |
 | `SMS_FIELD_CLOCK=retrace` | shots/autopress count VI retraces (wall clock) instead of game fields (2 per display copy, the default) |
 | `SMS_VI_DETERMINISTIC=1` | virtual VI/OS clock: retraces fire when the game idles (or spins on `OSGetTick` for a whole field), `OSGetTime` follows them from a fixed date, AI DMA is paced by retraces (no output device); two runs with the same input give identical frames |
@@ -325,8 +334,13 @@ Measured headless on the 32-bit Linux build (Mesa llvmpipe software GL), 2026-09
   The deterministic title, plaza, gate and Eclipse captures are unchanged on NVIDIA and llvmpipe, in a window and headless.
 - **Widescreen** (`SMS_WIDESCREEN`): the game camera is widened by a port patch and sms_gx maps each draw into the wider EFB (`drawXMap` in `gx_render.cpp`).
   The HUD stays 4:3 in the middle by default.
+  Full-screen overlays the game draws with a texture are stretched across the frame like the faders (`GXPC_SetStretch2D`): the blue wall screen `TMapDrawWall` shows while the camera is inside a wall (`widescreen-06`).
   With `SMS_WIDESCREEN_HUD=edges` the gameplay HUD is anchored to the screen edges per piece, not per 2D batch (which pulls composite panes apart): `TGCConsole2::perform` marks its HUD drawing (`GXPC_SetHud`), and `J2DPane::draw` brackets each pane with its extent (`GXPC_HudPaneBegin`/`End`, patch `widescreen-03`).
+  The 2D particles the HUD emits at its panes (the coin counter's sparkle, the GO! trails) are drawn by the director's 2D emitter manager, which is drawn as HUD too, so each moves with the third of the screen it is in (`widescreen-04`).
   A piece is the outermost pane narrower than three quarters of the screen (the HUD's containers are 600 wide), and moves by which third of the 4:3 frame its centre is in; draws outside any piece (the water tank, drawn in 3D) move by their own extent.
+  The map screen (`TGuide`, patch `widescreen-05`) fills the wide frame, as the 16:9 map of later releases does, instead of a 4:3 sheet over the live game.
+  As `guide_1.blo` loads, the paper, the top and bottom bands and the grid rows run on to the screen edges, the vertical grid lines past the 4:3 frame are copies of the layout's first full-height line, and the drawings beside the island (palm trees, sunflowers, fish, compass, title, sun, Totals, ship and the two texts) move out by half the extra width on their side; the island, its places and the panels stay put, and the cursor reaches the new edges.
+  It draws through `GXPC_SetWide2D`: 2D at the 4:3 scale, centred, and past the 4:3 edges, with none of it stretched.
 - **30, 60 and 120 frames per second** (`SMS_FRAME_RATE`, patches `framerate-*`): 60 is the port default, 30 is native, and 120 is optional.
   `port_active_frame_rate` is the gameplay rate while `TMarDirector` runs, and 30 for logos, menus and movies.
   `SMSGetVSyncTimesPerSec` reports that rate, so animations and fades keep their real-time duration.
@@ -335,6 +349,7 @@ Measured headless on the 32-bit Linux build (Mesa llvmpipe software GL), 2026-09
   Frames keep to a fixed schedule of retraces (`framerate-37`, `port_vi_frame_wait`): retail waits for one more retrace after a frame that ends past its own, which halves the game's speed wherever the host's present waits for the display (vsync, macOS, the Steam Deck's compositor), so a late frame starts the next at once instead, and one a whole frame behind is not presented (but one is at least every 0.05 s) when that lets the game keep time, i.e. presenting is slow (2 ms or more on average, `sms_gx`) and the frames' other work fits in their time, so a host too slow for the frame rate still shows every frame; a frame more than 0.1 s late starts a new schedule, and the deterministic clock keeps retail's wait.
   `SMS_PRESENT_HZ=<rate>` makes each swap wait for a display at that rate, to try this without such a display.
   Movement keeps its 120 Hz ticks: `TMarDirector::direct` adds `600 / SMSGetVSyncTimesPerSec()` per frame and spends 5 per tick (four, two or one ticks per frame).
+  A bird's flight, take-off and landing (`TAnimalBird`) run on every movement tick but scaled their speeds by `SMSGetAnmFrameRate()`, so birds flew at half speed at 60 and a quarter at 120; `framerate-44` uses its 30 fps value there.
   The shared helpers in `src/port_include/port_framerate.h` scale visual steps by 30 / active rate, run native integer counters once per four movement ticks, and compensate tick animations by active rate / 30.
   Exponential chases use square roots at 60 and fourth roots at 120 to preserve their decay per second.
   `framerate-02` to `framerate-35` apply those helpers to wipes, gates, timers, flocks, effects, movement animations and sound.
@@ -344,6 +359,7 @@ Measured headless on the 32-bit Linux build (Mesa llvmpipe software GL), 2026-09
   JPA particles use whole 1/60 s steps; `framerate-36` runs their simulation on alternate frames at 120 while drawing every frame, avoiding truncation of the 0.5 animation rate to zero.
   `framerate-40` scales custom display-frame animation rates for Petey, Mecha Bowser, Hinokuri, Blooper, Wiggler and actor scripts; see [the animation timing audit](ANIMATION-TIMING.md) for the update-clock distinction and gameplay checks.
   A nerve that ends with its animation hands over to the next nerve one movement tick later, and the next nerve changes the animation. At 30 fps that happens before the animation pass. At 120 the pass would see the finished looping animation wrap to frame 0 first and replay its frame 0 animation sound (the gatekeeper's hit voice, again when its damage animation ends). `framerate-41` holds an actor's animation sound back at 60/120 while its spine is between nerves.
+  Hit checks run on one movement tick in four, once a frame at 30 fps but every other or every fourth frame at 60/120, so a contact attack that tests its animation's next step (a Blooper's punch, `checkPass(10)`) saw only part of the animation between two checks; `framerate-43` tests the whole native step there.
   VI captures, scripted input, deterministic audio DMA, tracing, virtual OS time and optional DVD timing retain native time units when the retrace rate doubles.
   `tools/framerate/check.sh` checks configuration and equal elapsed-time movement, integer counts and visual chases in both word sizes without requiring a GPU or high-refresh monitor.
   `tools/regress/regress.py fps120` checks the plaza gate at all three rates against its baseline and between word sizes.

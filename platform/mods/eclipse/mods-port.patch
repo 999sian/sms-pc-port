@@ -1,5 +1,63 @@
+--- a/bse/include/BetterSMS/music.hxx
++++ b/bse/include/BetterSMS/music.hxx
+@@ -125,6 +125,10 @@
+             bool isPlaying() const;
+             bool isPaused() const;
++            // The port: the stop and clear of leaving a stage are still to run
++            // (stopMusicOnExitStage); the next stage can be ready before they
++            // are, while the old song fades out.
++            bool isLeavingStage() const { return mRequestedClear; }
+ 
+             bool isLooping() const;
 --- a/bse/src/area.cpp
 +++ b/bse/src/area.cpp
+@@ -9,6 +9,9 @@
+ #define MESSAGE_NO_DATA "NO DATA"
+ 
+ static void moveStage_override(TMarDirector *director);
++// port: an episode's name for the port's warp menu (src/port_include/port_warp.h)
++extern "C" int (*port_warp_scenario_name_id)(int area, int episode);
++static int portWarpScenarioNameID(int area, int episode);
+ 
+ namespace BetterSMS {
+ 
+@@ -101,8 +104,36 @@
+ 
+         oldHeap->becomeCurrentHeap();
+     }
++
++    port_warp_scenario_name_id = portWarpScenarioNameID;
+ }
+ 
++// The episode's message in scenarioname.bmg, as the level select and the
++// pause menu name it: an area's by its scenario, a secret course's by its
++// Shine (an episode's or one of the stage's others); -1 for none.
++static int portWarpScenarioNameID(int area, int episode) {
++    if (area < 0 || area >= BETTER_SMS_AREA_MAX)
++        return -1;
++    const s32 shineStageID = sNormalAreaInfos[area].mShineStageID;
++    if (shineStageID < 0 || !sShineAreaInfos[shineStageID])
++        return -1;
++    const ShineAreaInfo &info = *sShineAreaInfos[shineStageID];
++    if (area < BETTER_SMS_EXAREA_MAX && sExAreaInfos[area].mShineStageID != -1) {
++        const s32 shineID = sExAreaInfos[area].mShineID;
++        for (int ex = 0; shineID != -1 && ex < 2; ++ex) {
++            const TGlobalVector<s32> &ids   = ex ? info.getExScenarioIDs() : info.getScenarioIDs();
++            const TGlobalVector<s32> &names = ex ? info.getExScenarioNameIDs() : info.getScenarioNameIDs();
++            for (size_t i = 0; i < ids.size() && i < names.size(); ++i) {
++                if (ids[i] == shineID)
++                    return names[i];
++            }
++        }
++        return -1;
++    }
++    const TGlobalVector<s32> &names = info.getScenarioNameIDs();
++    return episode >= 0 && size_t(episode) < names.size() ? names[episode] : -1;
++}
++
+ bool BetterSMS::Stage::registerShineStage(ShineAreaInfo *info) {
+     if (sShineAreaInfos[info->getShineStageID()]) {
+         OSReport("[WARN] Overwriting stage info for stage %d\n", info->getShineStageID());
 @@ -359,8 +359,8 @@
  SMS_NO_INLINE static const char *loadScenarioNameFromBMGAfterStub(u8 *pause_menu, void* global_bmg) {
      const char *name = loadScenarioNameFromBMGAfter(global_bmg);
@@ -64,7 +122,70 @@
  }
 --- a/bse/src/music.cpp
 +++ b/bse/src/music.cpp
-@@ -487,12 +487,12 @@
+@@ -241,9 +241,50 @@
+ void AudioStreamer::setVolumeFadeTo(u8 to, f32 seconds) {
++    // The port: a song being stopped fades out to silence before the stop
++    // (and the next song) runs. Eclipse's Shadow Mario episodes set the
++    // stream's volume from his distance every frame; a console's slow stage
++    // load let the character select's stop finish first, but here the stage
++    // was running while it faded and held it at that volume, so the stop
++    // never ran and the character select's song played on.
++    if (mRequestedStop)
++        return;
+     _mTargetVolume = to;
+     _mFadeTime     = seconds;
+ }
+ 
+ bool AudioStreamer::queueAudio(const AudioPacket &packet) {
++    // The port: leaving a stage stops the song with a 0.8 s fade and clears the
++    // queue once the fade ends. A console spends seconds reading the next stage
++    // from the disc, so the clear has run before that stage queues its song.
++    // Here the stage is ready long before, and the late clear dropped the new
++    // song too (silent secret course intros, silent stages without an intro,
++    // and nothing for Pizza Time's skipStream to play). Finish the old song now.
++    if (mRequestedClear) {
++        if (_mIsPlaying || _mIsPaused || mRequestedStop)
++            stopLowStream();
++        _mIsPlaying         = false;
++        _mIsPaused          = false;
++        mRequestedStop      = false;
++        mRequestedPause     = false;
++        mRequestedNext      = false;
++        mRequestedPlay      = false;
++        _mDelayedTime       = 0.0f;
++        _mFadeTime          = 0.0f;
++        _mTargetVolume      = 0;
++        _mVolLeft           = 0;
++        _mVolRight          = 0;
++        _mPreservedVolLeft  = 0;
++        _mPreservedVolRight = 0;
++
++        TAtomicGuard guard;
++
++        _mAudioIndex = 0;
++        for (size_t i = 0; i < AudioQueueSize; ++i) {
++            _mAudioQueue[i] = AudioPacket();
++        }
++        mStreamPos      = 0;
++        mRequestedClear = false;
++    }
++
+     for (u32 i = 0; i < AudioQueueSize; ++i) {
+         AudioPacket &slot = _mAudioQueue[(i + _mAudioIndex) % AudioQueueSize];
+         if (slot.getID() == 0xFFFFFFFF) {
+@@ -340,8 +381,9 @@
+ }
+ 
+ void AudioStreamer::clear() {
+-    sAudioCommand = AudioCommand::CLEAR;
+-    OSSendMessage(&mMessageQueue, static_cast<u32>(sAudioCommand), OS_MESSAGE_NOBLOCK);
++    // The port: flagged here, not by the audio thread, so queueAudio above
++    // sees a clear that is still to run whichever thread ran first.
++    clear_();
+ }
+ 
+ SMS_NO_INLINE bool AudioStreamer::play_() {
+@@ -487,12 +529,12 @@
  
  static JAISound *GetJAISoundForMusic(u32 id) {
      JAISound **unk = (JAISound **)search__19JALListS_5(id & 0x3FF); 
@@ -79,6 +200,22 @@
  }
  
  static f32 GetJAISoundSeInterVolume(JAISound *sound, u8 channel) {
+@@ -959,8 +993,14 @@
+     if (!config->mMusicEnabled.get())
+         return;
+ 
+     if (config->mIsExStage.get()) {
+-        if (MSBgm::getHandle(0) || streamer->isPlaying()) {
++        // The port: a secret course leaves its music to the entrance demo
++        // (initExMusic) when a song is already playing. A console reads the
++        // course from the disc while the last stage's song fades out, so that
++        // song has stopped by now; here it can still be fading, and courses
++        // with sequenced music (Daisy Cruiser's) stayed silent until Mario
++        // died and the stage started again.
++        if (MSBgm::getHandle(0) || (streamer->isPlaying() && !streamer->isLeavingStage())) {
+             return;
+         }
+     }
 --- a/bse/src/p_settings.hxx
 +++ b/bse/src/p_settings.hxx
 @@ -1246,8 +1246,8 @@
@@ -450,13 +587,17 @@
                  target->_118++;
              }
              target->mTarget = 0;
-@@ -333,7 +338,7 @@
+@@ -333,7 +338,10 @@
  
                      JPABaseEmitter *emitterFireCb =
                          gpMarioParticleManager->emitAndBindToMtxPtr(0x1a6, *fire_mtx, 1, target);
 -                    *(JPACallBackBase<> **)((u8 *)emitterFireCb + 0x110) =
-+                    *(JPACallBackBase<> **)((u8 *)emitterFireCb + SMS_OFFSET(JPABaseEmitter, 0x110)) =
-                         target->m_fire_particle_callback;
+-                        target->m_fire_particle_callback;
++                    // The port: there is no emitter when the particle pool is
++                    // full; bowser_car.cpp's fire breath checks for that too.
++                    if (emitterFireCb)
++                        *(JPACallBackBase<> **)((u8 *)emitterFireCb + SMS_OFFSET(JPABaseEmitter, 0x110)) =
++                            target->m_fire_particle_callback;
  
                      gpMarioParticleManager->emitAndBindToMtxPtr(0x1a5, *fire_mtx, 1, target);
 --- a/eclipse/src/menu/character_select.cpp
@@ -733,7 +874,60 @@
      startStageEntranceDemo__10MSMainProcFUcUc(director->mAreaID, director->mEpisodeID);
 --- a/eclipse/src/stage/music.cpp
 +++ b/eclipse/src/stage/music.cpp
-@@ -93,16 +93,28 @@
+@@ -49,11 +49,21 @@
+     ~MSStageDistFadeStream(){};
+ 
+     void proc() override {
+-        if (!Music::isPlaying() || Music::isPaused()) {
++        if (Music::isPaused()) {
+             return;
+         }
+ 
+         MSBgm *handle = (MSBgm *)MSBgm::getHandle(1);
++        if (!Music::isPlaying()) {
++            // The Shadow Mario theme starts with the stage at full volume, but the
++            // stage song only streams from GO!. Hold the theme at its distance
++            // blend until then so it doesn't blare before the crossfade takes over.
++            if (handle != nullptr) {
++                MSBgm::setTrackVolume(1, distanceBlend(), 0, 0);
++            }
++            return;
++        }
++
+         if (handle == nullptr) {
+             if (mFrameCounter++ >= 150 && !mFadedPermanently) {
+                 Music::setVolumeFade(Music::getMaxVolume(), 0.4f);
+@@ -62,14 +72,7 @@
+             return;
+         }
+ 
+-        f32 distance = PSVECDistance(*gpMarioPos, mPosPtr);
+-
+-        f32 blend = 0.0f;
+-        if (distance <= mBlendRadiusEnd && distance > mBlendRadiusStart) {
+-            blend = (mBlendRadiusEnd - distance) / (mBlendRadiusEnd - mBlendRadiusStart);
+-        } else if (distance <= mBlendRadiusStart) {
+-            blend = 1.0f;
+-        }
++        f32 blend = distanceBlend();
+ 
+         f32 *timingTable = (f32 *)sms_mod_rawdata(0x803ACA68);
+         f32 *expTable    = (f32 *)sms_mod_rawdata(0x803ACAB0);
+@@ -90,19 +93,42 @@
+     }
+ 
+ private:
++    f32 distanceBlend() const {
++        f32 distance = PSVECDistance(*gpMarioPos, mPosPtr);
++        if (distance <= mBlendRadiusStart) {
++            return 1.0f;
++        }
++        if (distance <= mBlendRadiusEnd) {
++            return (mBlendRadiusEnd - distance) / (mBlendRadiusEnd - mBlendRadiusStart);
++        }
++        return 0.0f;
++    }
++
      bool mFadedPermanently;
  };
  
@@ -768,7 +962,7 @@
              OSReport("MSoundEnterStageExtended: Episode 6\n");
          }
      }
-@@ -114,7 +126,7 @@
+@@ -114,7 +140,7 @@
      bool excluded = area == SME::STAGE_LACRIMA || area == SME::STAGE_LACRIMA_INSIDE;
      if (!excluded && area >= SME::STAGE_ERTO && area <= SME::STAGE_LACRIMA_BACKHOUSE) {
          if (episode == 6) {

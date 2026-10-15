@@ -767,6 +767,7 @@ static const struct {
 	{ "widescreen_hud", "SMS_WIDESCREEN_HUD" }, // centre or edges
 	{ "frame_rate", "SMS_FRAME_RATE" },         // 30, 60 (default), or 120
 	{ "mod", "SMS_MOD" },
+	{ "language", "SMS_LANGUAGE" }, // en (default), or any pack in mods/languages/<code>
 	{ "resolution", "SMS_GX_SCALE" },
 	{ "anisotropic", "SMS_ANISO" }, // 0, 2, 4, 8 or 16
 	{ "window_scale", "SMS_WINDOW_SCALE" },
@@ -798,6 +799,7 @@ static const struct {
 	{ "soft_trigger", "SMS_SOFT_TRIGGER" }, // L_SOFT / R_SOFT press depth, percent
 	{ "overlay", "SMS_OVERLAY" },
 	{ "save_dir", "SMS_SAVE_DIR" },
+	{ "save_state_dir", "SMS_SAVE_STATE_DIR" },
 	{ "disc_image", "SMS_DISC_IMAGE" },
 	{ "camera_invert_x", "SMS_CAMERA_INVERT_X" },
 	{ "camera_invert_y", "SMS_CAMERA_INVERT_Y" },

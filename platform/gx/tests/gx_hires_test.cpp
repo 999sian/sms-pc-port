@@ -45,6 +45,9 @@ static std::vector<uint8_t> bti(int id) {
 static std::string textureName(const std::vector<uint8_t>& d) {
     return gx::hiresName(d.data()+0x20, 1, 8, 4, false, nullptr, 0, false);
 }
+static std::string mipmappedName(const std::vector<uint8_t>& d) {
+    return gx::hiresName(d.data()+0x20, 1, 8, 4, true, nullptr, 0, false);
+}
 static size_t dds(const std::filesystem::path& path, int w, int h, int mips, bool bc7 = false) {
     std::vector<uint8_t> d(bc7 ? 148 : 128);
     std::memcpy(d.data(), "DDS ", 4);
@@ -65,6 +68,20 @@ static size_t dds(const std::filesystem::path& path, int w, int h, int mips, boo
     std::ofstream f(path, std::ios::binary); f.write(reinterpret_cast<const char*>(d.data()), d.size());
     return d.size()-header;
 }
+// A thin cut-out: one w x h BC7 level, clear black but for an opaque white
+// texel every 4 across and down.
+static void sparseDds(const std::filesystem::path& path, int w, int h) {
+    dds(path, w, h, 1, true);
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekp(148);
+    for (int by = 0; by < h / 4; ++by)
+        for (int bx = 0; bx < w / 4; ++bx) {
+            uint8_t rgba[64] = {}, block[16];
+            rgba[0] = rgba[1] = rgba[2] = rgba[3] = 255;  // the block's top-left texel
+            gx::encodeBlock(gx::BLOCK_BC7, rgba, block);
+            f.write(reinterpret_cast<const char*>(block), 16);
+        }
+}
 static PFNGLCOMPRESSEDTEXIMAGE2DPROC realCompressed;
 static PFNGLCOMPRESSEDTEXSUBIMAGE2DPROC realCompressedSub;
 static PFNGLTEXIMAGE2DPROC realImage;
@@ -76,22 +93,44 @@ static PFNGLGETINTEGERVPROC realGet;
 static int compressedCalls, rgbaCalls, maxLevel;
 static size_t uploadedBytes, largestCall;
 static void sentData(size_t n) { uploadedBytes += n; largestCall = std::max(largestCall, n); }
+// The texels (RGBA) of level watchLevel when it is sent whole.
+static int watchLevel = -1;
+static std::vector<uint8_t> watched;
+static void watch(GLint l, GLsizei w, GLsizei h, GLenum f, const void* p) {
+    if (l != watchLevel || !p) return;
+    watched.assign(size_t(w) * h * 4, 0);
+    if (f == GL_RGBA) { std::memcpy(watched.data(), p, watched.size()); return; }
+    if (f != 0x8E8C) return;  // BC7
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    uint8_t out[64];
+    for (int by = 0; by < (h + 3) / 4; ++by)
+        for (int bx = 0; bx < (w + 3) / 4; ++bx, b += 16) {
+            bcdec_bc7(b, out, 16);
+            for (int i = 0; i < 16; ++i)
+                if (bx*4 + i%4 < w && by*4 + i/4 < h)
+                    std::memcpy(&watched[(size_t(by*4 + i/4) * w + bx*4 + i%4) * 4], out + i*4, 4);
+        }
+}
 static void APIENTRY recordCompressed(GLenum t, GLint l, GLenum f, GLsizei w, GLsizei h, GLint b, GLsizei n, const void* p) {
     if (p) { ++compressedCalls; sentData(size_t(n)); }
+    watch(l, w, h, f, p);
     realCompressed(t,l,f,w,h,b,n,p);
 }
 static void APIENTRY recordCompressedSub(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLsizei n,
                                          const void* p) {
     ++compressedCalls; sentData(size_t(n));
+    if (!x && !y) watch(l, w, h, f, p);
     realCompressedSub(t,l,x,y,w,h,f,n,p);
 }
 static void APIENTRY recordImage(GLenum t, GLint l, GLint f, GLsizei w, GLsizei h, GLint b, GLenum fmt, GLenum ty, const void* p) {
     if (p) { ++rgbaCalls; sentData(size_t(w)*h*4); }
+    watch(l, w, h, fmt, p);
     realImage(t,l,f,w,h,b,fmt,ty,p);
 }
 static void APIENTRY recordImageSub(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum ty,
                                     const void* p) {
     ++rgbaCalls; sentData(size_t(w)*h*4);
+    if (!x && !y) watch(l, w, h, fmt, p);
     realImageSub(t,l,x,y,w,h,fmt,ty,p);
 }
 static void APIENTRY recordParam(GLenum t, GLenum pname, GLint value) {
@@ -183,6 +222,8 @@ int main(int argc, char** argv) {
     dds(dir/(textureName(late)+".dds"), 16, 8, 1);
     dds(dir/(textureName(external)+".dds"), 16, 8, 1);
     dds(dir/(textureName(external)+"_mip1.dds"), 8, 4, 1);
+    auto cutout = bti(8);
+    sparseDds(dir/(mipmappedName(cutout)+".dds"), 32, 16);
     std::vector<std::vector<uint8_t>> many;
     for (int i = 10; i < 34; ++i) {
         many.push_back(bti(i));
@@ -287,6 +328,17 @@ int main(int argc, char** argv) {
     complete();
     expect(fallback ? rgbaCalls == 5 : (compressedCalls == 5 && uploadedBytes == 104 && maxLevel == 4),
         "external mip files are completed after their last level");
+    // The levels made for a mipmapped cut-out keep its strands, which a box
+    // filter alone leaves at a quarter of their alpha, in their own colour.
+    watchLevel = 1;
+    watched.clear();
+    prepare(cutout, "cutout.bti");
+    complete();
+    watchLevel = -1;
+    size_t kept = 0, white = 0;
+    for (size_t i = 0; i < watched.size(); i += 4)
+        if (watched[i+3] >= 120) { ++kept; white += watched[i] >= 240; }
+    expect(watched.size() == 16*8*4 && kept == 32 && white == kept, "a cut-out's made levels keep its coverage and colour");
     expect(glGetError() == GL_NO_ERROR, "compressed/partial/fallback uploads are accepted by GL");
     resetRecord();
     GXPC_PrefetchResource(model.data(), 0x2C, "truncated.bmd");

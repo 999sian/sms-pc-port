@@ -90,6 +90,7 @@ struct XMap {
 };
 static XMap s_xmap;
 static bool s_stretch2D = false;  // GXPC_SetStretch2D: the game's faders
+static bool s_wide2D = false;     // GXPC_SetWide2D: 2D the game laid out past the 4:3 edges (the map)
 // SMS_WIDESCREEN_HUD=edges: while the game draws its gameplay HUD
 // (GXPC_SetHud), a piece in the left third of the 4:3 frame goes to the left
 // edge of the wide one and one in the right third to the right edge; the
@@ -1650,13 +1651,15 @@ static void uploadUniforms(const ShaderProgram* sp, float texW[8], float texH[8]
         row1[1] = sext11((r1 >> 11) & 0x7FF) / 1024.0f;
         row0[2] = sext11(r2 & 0x7FF) / 1024.0f;
         row1[2] = sext11((r2 >> 11) & 0x7FF) / 1024.0f;
-        row0[3] = ldexpf(1.0f, sc);
+        row0[3] = float(sc);  // the scale's exponent: the shader shifts by it
         row1[3] = 0.0f;
     }
     UNI(uIndMtx, indmtx, im, glUniform4fv(sp->uIndMtx, 6, im));
 
     float efb[2] = {float(s_efbW), float(EFB_H)};
     UNI(uEfb, efb, efb, glUniform2fv(sp->uEfb, 1, efb));
+    float lw[1] = {float(g.bp[BP_LPSIZE] & 0xFF) / 6.0f};  // line programs: GXSetLineWidth's sixths of a pixel
+    UNI(uLineWidth, linewidth, lw, glUniform1fv(sp->uLineWidth, 1, lw));
     float proj[8] = {xff(XFR_PROJ), xff(XFR_PROJ + 1), xff(XFR_PROJ + 2), xff(XFR_PROJ + 3),
                      xff(XFR_PROJ + 4), xff(XFR_PROJ + 5), float(g.xfReg[XFR_PROJ + 6] & 1), 0.0f};
     UNI(uProj, proj, proj, glUniform4fv(sp->uProj, 2, proj));
@@ -1985,6 +1988,10 @@ static XMap drawXMap() {
         m.a = s_wide;
         return m;
     }
+    if (s_wide2D && (g.xfReg[XFR_PROJ + 6] & 1)) {  // laid out wide: the 4:3 scale, centred
+        m.b = float(s_ox);
+        return m;
+    }
     float sx = xff(XFR_VIEWPORT), cx = xff(XFR_VIEWPORT + 3) - 342.0f;
     bool fullWidth = fabsf(fabsf(sx) * 2.0f - float(EFB_W)) < 2.0f && fabsf(cx - float(EFB_W) / 2) < 2.0f;
     if (!fullWidth) {
@@ -2056,7 +2063,7 @@ void flushBatch() {
     GxTimer timer;
     GxTimer tf(&g_flushSeconds);
     s_xmap = drawXMap();
-    const ShaderProgram* sp = shaderForCurrentState();
+    const ShaderProgram* sp = shaderForCurrentState(false, s_bclass == PRIM_LINES);
     glcUseProgram(sp->prog);
     applyGlState();
 
@@ -2159,12 +2166,12 @@ void flushBatch() {
         }
     }
     if (s_pixActive && android::metricActive()) {
-        const ShaderProgram* metricSp = shaderForCurrentState(false, true);
+        const ShaderProgram* metricSp = shaderForCurrentState(false, s_bclass == PRIM_LINES, true);
         glcUseProgram(metricSp->prog);
         uploadUniforms(metricSp, texW, texH);
         const ShaderProgram* depthSp = nullptr;
         if (earlyFallback) {
-            depthSp = shaderForCurrentState(true);
+            depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
             glcUseProgram(depthSp->prog);
             uploadUniforms(depthSp, texW, texH);
         }
@@ -2213,7 +2220,7 @@ void flushBatch() {
     } else
     #endif
     if (earlyFallback) {
-        const ShaderProgram* depthSp = shaderForCurrentState(true);
+        const ShaderProgram* depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
         glcUseProgram(depthSp->prog);
         uploadUniforms(depthSp, texW, texH);
         GLboolean masks[4];
@@ -3339,6 +3346,12 @@ void GXPC_SetStretch2D(int on) {
     s_stretch2D = on != 0;
 }
 
+void GXPC_SetWide2D(int on) {
+    if (s_efbW == EFB_W || s_wide2D == (on != 0)) return;
+    flushBatch();
+    s_wide2D = on != 0;
+}
+
 void GXPC_SetWidescreen(float widthOver43) {
     if (s_ready) return;  // the EFB size is fixed once it exists
     s_wide = widthOver43 > 1.0f ? widthOver43 : 1.0f;
@@ -3376,6 +3389,37 @@ void GXPC_DrawOverlay(const uint8_t* rgba, int w, int h, int x, int y, int scale
 }
 
 }  // extern "C"
+
+// SMS_WINDOW_SHOTS=frame,frame,...: the window as it is shown, with the menus
+// drawn over the game, at those GX frames (GXPC_FrameCount), written to
+// SMS_SHOT_DIR (default "shots") as window<frame>.ppm. The XFB captures
+// (SMS_SHOTS) have the game's picture only.
+void gx::captureWindow(uint32_t frame, int w, int h) {
+    static std::vector<uint32_t> frames;
+    static bool parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char* e = getenv("SMS_WINDOW_SHOTS"))
+            for (const char* p = e; *p;) {
+                frames.push_back(uint32_t(strtoul(p, const_cast<char**>(&p), 10)));
+                while (*p == ',' || *p == ' ') p++;
+            }
+    }
+    if (w <= 0 || h <= 0 || std::find(frames.begin(), frames.end(), frame) == frames.end()) return;
+    std::vector<uint8_t> px(size_t(w) * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const char* dir = getenv("SMS_SHOT_DIR");
+    char path[1024];
+    snprintf(path, sizeof path, "%s/window%05u.ppm", dir ? dir : "shots", frame);
+    if (FILE* f = fopen(path, "wb")) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--)  // GL's rows go bottom up
+            for (int x = 0; x < w; x++) fwrite(&px[(size_t(y) * w + x) * 4], 1, 3, f);
+        fclose(f);
+        fprintf(stderr, "[sms_gx] captured the window at frame %u -> %s\n", frame, path);
+    }
+}
 
 void gx::drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH) {
     if (!s_ready || w <= 0 || h <= 0) return;
