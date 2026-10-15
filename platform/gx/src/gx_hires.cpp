@@ -323,12 +323,33 @@ struct Loaded {
     GLenum compressed = 0;                     // the levels' GL block format, 0 for RGBA8
     int blocks = 0;                            // and their DDS block format (DDS_BC*)
     int first = 0;                             // the level levels[0] is (a completion's)
+    int scale = 0;                             // log2 of w over the original's width
+    bool mipmapped = false;                    // the original is sampled with mipmaps (_m)
+    std::vector<float> original;               // the original's coverage by level (hiresNoteOriginal)
     bool arbitrary = false;
     bool failed = false;
 };
 
 // What the GL takes compressed (queried on the render thread by the scan).
 static bool s_s3tc = false, s_bptc = false;
+
+// hiresNoteOriginal's, by replacement name: noted on resource-loading threads
+// and the render thread, read by the workers' decodes.
+static std::mutex& s_originalMu = *new std::mutex;
+static std::unordered_map<std::string, std::vector<float>>& s_original =
+    *new std::unordered_map<std::string, std::vector<float>>;
+
+float alphaCoverage(const uint8_t* rgba, size_t texels) {
+    size_t pass = 0;
+    for (size_t i = 0; i < texels; i++) pass += rgba[i * 4 + 3] >= 128;
+    return texels ? float(double(pass) / double(texels)) : 1.0f;
+}
+
+void hiresNoteOriginal(const std::string& name, std::vector<float> coverage) {
+    if (coverage.empty() || name.find("_m_") == std::string::npos) return;  // only mipmapped ones use it
+    std::lock_guard<std::mutex> lk(s_originalMu);
+    s_original[name] = std::move(coverage);
+}
 
 static void queryFormats() {
     GLint n = 0, major = 0, minor = 0;
@@ -567,6 +588,22 @@ static void prefetchTimg(const uint8_t* data, size_t size, size_t off) {
     bool mipmapped = t[0x14] >= 2 && t[0x17] != 0;
     std::string name = hiresName(t + image, fmt, w, h, mipmapped, palette, paletteBytes, true);
     if (name.empty()) name = hiresName(t + image, fmt, w, h, !mipmapped, palette, paletteBytes, true);
+    if (name.empty()) return;
+    std::vector<float> coverage;  // for completeChain, which uses it for mipmapped replacements
+    std::vector<uint8_t> rgba;
+    size_t at = off + image;
+    const bool m = name.find("_m_") != std::string::npos;
+    for (uint32_t l = 0, lw = w, lh = h; m && l < std::max(1u, uint32_t(t[0x18])); l++) {
+        size_t n = texLevelBytes(fmt, lw, lh);
+        if (n > size - at) break;
+        rgba.resize(size_t(lw) * lh * 4);
+        decodeTexture(data + at, fmt, lw, lh, palette, t[0x09], rgba.data());
+        coverage.push_back(alphaCoverage(rgba.data(), size_t(lw) * lh));
+        at += n;
+        lw = std::max(1u, lw / 2);
+        lh = std::max(1u, lh / 2);
+    }
+    hiresNoteOriginal(name, std::move(coverage));
     requestTexture(name, w, h);
 }
 
@@ -602,18 +639,100 @@ void hiresPrefetchResource(const void* ptr, uint32_t size, const char* name) {
     }
 }
 
+// ------------------------------------------------------------------ cut-out coverage
+// A 2x2 box filter averages a thin cut-out strand's alpha with the clear
+// texels beside it, so in the levels completeChain makes a fence, grate or
+// leaf fades under the alpha test that draws it (alpha >= 128 in most of the
+// game's cut-out materials) until it is gone: Pinna Park's climbing-cage mesh
+// vanished a few metres away, where the disc's own hand-drawn levels keep it
+// solid. So for a cut-out replacing a mipmapped texture (alpha mostly clear
+// or opaque, with some of each) every level made is scaled up until as many
+// of its texels pass 128 as in the last level the pack supplied (Castano,
+// "Computing Alpha Mipmaps"), or as in the original's level of that size if
+// more: the cage's levels thicken its mesh (30% of texels pass in level 0,
+// 69% in the 8x8), so it reads as a green mesh at any distance. The scale
+// only grows alpha, and at most 8 times. Their colours are weighted by alpha,
+// so the clear texels' colour (black, in most packs) doesn't darken the
+// strands. Others, such as the HUD's blended pictures, keep the box filter.
+struct AlphaHist {
+    uint64_t n[256] = {};
+    void add(const AlphaHist& o) {
+        for (int a = 0; a < 256; a++) n[a] += o.n[a];
+    }
+    uint64_t total() const {
+        uint64_t t = 0;
+        for (int a = 0; a < 256; a++) t += n[a];
+        return t;
+    }
+};
+struct Coverage {
+    bool known = false;  // `target` measured (on the first level made's source)
+    double target = -1;  // the share of texels at or above 128 to keep; < 0: not a cut-out
+    const Loaded* L = nullptr;
+    // The share for replacement level `level`.
+    double at(int level) const {
+        const int k = level - L->scale;  // the original's level of that size
+        if (k < 0 || L->original.empty() || L->original[0] >= 1.0f) return target;
+        return std::max(target, double(L->original[std::min<size_t>(size_t(k), L->original.size() - 1)]));
+    }
+};
+
+static void measureCoverage(Coverage* cov, const AlphaHist& src) {
+    uint64_t total = src.total(), clear = 0, soft = 0;
+    for (int a = 0; a < 256; a++) {
+        if (a < 128) clear += src.n[a];
+        if (a >= 16 && a < 240) soft += src.n[a];
+    }
+    cov->known = true;
+    // Mostly in-between alpha (smoke, glows, shadows) is blended, not cut out.
+    if (total && clear >= total / 50 && total - clear >= total / 100 && soft <= total / 4)
+        cov->target = double(total - clear) / double(total);
+}
+
+// The alpha that should become 128 in level `level`, of histogram `h`: the
+// highest that lets at least the target's share pass (rounding the other way
+// would lose a level's lone strands, at a quarter of their alpha, altogether).
+static int coverageCut(const Coverage& cov, int level, const AlphaHist& h) {
+    if (cov.target < 0) return 128;
+    const double want = cov.at(level) * double(h.total());
+    uint64_t at = 0;  // texels at or above t
+    for (int t = 255; t > 128; t--) at += h.n[t];
+    for (int t = 128; t > 16; t--) {
+        at += h.n[t];
+        if (double(at) >= want) return t;
+    }
+    return 16;
+}
+
+static inline uint8_t scaleAlpha(uint8_t a, int cut) { return uint8_t(std::min(255, a * 128 / cut)); }
+
+// A 2x2 box filter of texels a-d into o; for a cut-out, colour by alpha.
+static inline void boxTexel(const uint8_t* a, const uint8_t* b, const uint8_t* c, const uint8_t* d, bool cutout,
+                            uint8_t* o) {
+    const int sa = a[3] + b[3] + c[3] + d[3];
+    for (int i = 0; i < 3; i++)
+        o[i] = cutout && sa ? uint8_t((a[i] * a[3] + b[i] * b[3] + c[i] * c[3] + d[i] * d[3] + sa / 2) / sa)
+                            : uint8_t((a[i] + b[i] + c[i] + d[i] + 2) / 4);
+    o[3] = uint8_t((sa + 2) / 4);
+}
+
 // The next level of a compressed one (lw x lh), by the same 2x2 box filter,
 // in the same block format. Two block rows are decoded at a time, so even a
 // 16384x16384 level never sits in memory as RGBA, and a large level's block
 // rows are shared between threads (an 8192x8192 BC7 file takes about a second
 // on four), leaving two cores to the game and render threads it runs beside.
-static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& src, int lw, int lh, bool idle) {
+// For a cut-out (or one not yet known not to be) a first pass measures the
+// alpha of the source and of the level, without encoding, for `cov`.
+static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& src, int lw, int lh, bool idle,
+                                           Coverage* cov, int level) {
     int nw = std::max(1, lw / 2), nh = std::max(1, lh / 2);
     int sbw = (lw + 3) / 4, sbh = (lh + 3) / 4, dbw = (nw + 3) / 4, dbh = (nh + 3) / 4;
     size_t bsz = fmt == DDS_BC1 ? 8 : 16;
     std::vector<uint8_t> dst(size_t(dbw) * dbh * bsz);
     int pitch = sbw * 16;  // bytes in a decoded source row
-    auto rows = [&](int from, int to) {
+    int cut = 128;
+    // With `hist` (source, level), it measures; else it encodes into dst.
+    auto rows = [&](int from, int to, AlphaHist* hist) {
         std::vector<uint8_t> in(size_t(pitch) * 8), out(size_t(dbw) * 16 * 4);
         for (int by = from; by < to; by++) {
             for (int k = 0; k < 2 && 2 * by + k < sbh; k++)  // source rows 8*by to 8*by+7
@@ -625,6 +744,9 @@ static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& 
                     else if (fmt == DDS_BC3) bcdec_bc3(b, o, pitch);
                     else bcdec_bc7(b, o, pitch);
                 }
+            if (hist && !cov->known)
+                for (int y = 8 * by; y < std::min(8 * by + 8, lh); y++)
+                    for (int x = 0; x < lw; x++) hist[0].n[in[size_t(y - 8 * by) * pitch + x * 4 + 3]]++;
             for (int r = 0; r < 4; r++) {  // this block row's 4 output rows; past the image, the last one again
                 int y = std::min(4 * by + r, nh - 1);
                 const uint8_t* s0 = &in[size_t(std::min(2 * y, lh - 1) - 8 * by) * pitch];
@@ -633,10 +755,12 @@ static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& 
                 for (int x = 0; x < dbw * 4; x++) {
                     int xx = std::min(x, nw - 1);
                     int x0 = std::min(2 * xx, lw - 1) * 4, x1 = std::min(2 * xx + 1, lw - 1) * 4;
-                    for (int c = 0; c < 4; c++)
-                        o[x * 4 + c] = uint8_t((s0[x0 + c] + s0[x1 + c] + s1[x0 + c] + s1[x1 + c] + 2) / 4);
+                    boxTexel(s0 + x0, s0 + x1, s1 + x0, s1 + x1, !hist && cov->target >= 0, o + x * 4);
+                    if (hist && x < nw && 4 * by + r < nh) hist[1].n[o[x * 4 + 3]]++;
+                    if (cut < 128) o[x * 4 + 3] = scaleAlpha(o[x * 4 + 3], cut);
                 }
             }
+            if (hist) continue;
             for (int bx = 0; bx < dbw; bx++) {
                 uint8_t block[64];
                 for (int r = 0; r < 4; r++) memcpy(block + r * 16, &out[(size_t(r) * dbw * 4 + bx * 4) * 4], 16);
@@ -644,19 +768,29 @@ static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& 
             }
         }
     };
-    int threads = std::min<int>({int(std::thread::hardware_concurrency()) - 2, 8, dbh / 16});
-    if (threads <= 1) {
-        rows(0, dbh);
-        return dst;
+    int threads = std::max(1, std::min<int>({int(std::thread::hardware_concurrency()) - 2, 8, dbh / 16}));
+    auto pass = [&](std::vector<AlphaHist>* hists) {  // one pair of histograms per thread when measuring
+        auto slot = [hists](int t) { return hists ? &(*hists)[size_t(t) * 2] : nullptr; };
+        std::vector<std::thread> pool;
+        for (int t = 1; t < threads; t++)
+            pool.emplace_back([&rows, idle, h = slot(t), from = dbh * t / threads, to = dbh * (t + 1) / threads] {
+                if (idle) idlePriority();
+                rows(from, to, h);
+            });
+        rows(0, dbh / threads, slot(0));
+        for (std::thread& t : pool) t.join();
+    };
+    if (!cov->known || cov->target >= 0) {
+        std::vector<AlphaHist> hists(size_t(threads) * 2);
+        pass(&hists);
+        for (int t = 1; t < threads; t++) {
+            hists[0].add(hists[size_t(t) * 2]);
+            hists[1].add(hists[size_t(t) * 2 + 1]);
+        }
+        if (!cov->known) measureCoverage(cov, hists[0]);
+        cut = coverageCut(*cov, level, hists[1]);
     }
-    std::vector<std::thread> pool;
-    for (int t = 1; t < threads; t++)
-        pool.emplace_back([&rows, idle, from = dbh * t / threads, to = dbh * (t + 1) / threads] {
-            if (idle) idlePriority();
-            rows(from, to);
-        });
-    rows(0, dbh / threads);
-    for (std::thread& t : pool) t.join();
+    pass(nullptr);
     return dst;
 }
 
@@ -664,7 +798,8 @@ static std::vector<uint8_t> nextBlockLevel(int fmt, const std::vector<uint8_t>& 
 // whatever levels the pack supplied: the sampler minifies a replacement as far
 // as its original (samplerFor), and without the lower levels a far wall
 // samples an 8192x8192 replacement's top level and shimmers as the camera
-// moves (Noki Bay's undersea walls, whose pack files have one level).
+// moves (Noki Bay's undersea walls, whose pack files have one level). A
+// cut-out's levels keep its coverage (Coverage).
 // Compressed levels take a while to encode, so outside SMS_TEXTURE_PACK_SYNC
 // they follow the pack's own levels instead of delaying them (completeLater).
 static void completeChain(Loaded* L, bool idle = false) {
@@ -674,9 +809,12 @@ static void completeChain(Loaded* L, bool idle = false) {
         lw = std::max(1, lw / 2);
         lh = std::max(1, lh / 2);
     }
+    Coverage cov;
+    cov.L = L;
+    cov.known = !L->mipmapped;
     if (L->compressed) {
         while (lw > 1 || lh > 1) {
-            L->levels.push_back(nextBlockLevel(L->blocks, L->levels.back(), lw, lh, idle));
+            L->levels.push_back(nextBlockLevel(L->blocks, L->levels.back(), lw, lh, idle, &cov, int(L->levels.size())));
             lw = std::max(1, lw / 2);
             lh = std::max(1, lh / 2);
         }
@@ -685,17 +823,25 @@ static void completeChain(Loaded* L, bool idle = false) {
     while (lw > 1 || lh > 1) {
         int nw = std::max(1, lw / 2), nh = std::max(1, lh / 2);
         const std::vector<uint8_t>& src = L->levels.back();
+        if (!cov.known) {
+            AlphaHist h;
+            for (size_t i = 3; i < src.size(); i += 4) h.n[src[i]]++;
+            measureCoverage(&cov, h);
+        }
         std::vector<uint8_t> dst(size_t(nw) * nh * 4);
+        AlphaHist h;
         for (int y = 0; y < nh; y++)
             for (int x = 0; x < nw; x++) {
                 int x0 = std::min(2 * x, lw - 1), x1 = std::min(2 * x + 1, lw - 1);
                 int y0 = std::min(2 * y, lh - 1), y1 = std::min(2 * y + 1, lh - 1);
-                for (int c = 0; c < 4; c++) {
-                    int sum = src[(size_t(y0) * lw + x0) * 4 + c] + src[(size_t(y0) * lw + x1) * 4 + c] +
-                              src[(size_t(y1) * lw + x0) * 4 + c] + src[(size_t(y1) * lw + x1) * 4 + c];
-                    dst[(size_t(y) * nw + x) * 4 + c] = uint8_t((sum + 2) / 4);
-                }
+                uint8_t* o = &dst[(size_t(y) * nw + x) * 4];
+                boxTexel(&src[(size_t(y0) * lw + x0) * 4], &src[(size_t(y0) * lw + x1) * 4],
+                         &src[(size_t(y1) * lw + x0) * 4], &src[(size_t(y1) * lw + x1) * 4], cov.target >= 0, o);
+                h.n[o[3]]++;
             }
+        int cut = coverageCut(cov, int(L->levels.size()), h);
+        if (cut < 128)
+            for (size_t i = 3; i < dst.size(); i += 4) dst[i] = scaleAlpha(dst[i], cut);
         L->levels.push_back(std::move(dst));
         lw = nw;
         lh = nh;
@@ -715,13 +861,15 @@ static int chainLength(int w, int h) {
 // replacement, <name>.mips, under texture-mips/ beside the shader cache
 // (userCacheDir); a file is used only while its source keeps the size and
 // modification time it was made from. SMS_TEXTURE_PACK_CACHE=dir keeps them
-// there instead; =0 turns this off.
-static const char kMipsMagic[8] = {'S', 'M', 'S', 'M', 'I', 'P', 'S', '1'};
+// there instead; =0 turns this off. The magic's digit changes with the way
+// levels are made (2: cut-outs keep their coverage), so older files are remade.
+static const char kMipsMagic[8] = {'S', 'M', 'S', 'M', 'I', 'P', 'S', '2'};
+enum { MIPS_ORIGINAL = 1 };  // made knowing the original's coverage (Coverage)
 struct MipsHeader {  // the same in 32- and 64-bit builds, which share the folder
     char magic[8];
     uint64_t size;
     int64_t mtime;
-    uint32_t w, h, blocks, first, count, reserved;
+    uint32_t w, h, blocks, first, count, flags;
 };
 static_assert(sizeof(MipsHeader) == 48, "MipsHeader has no padding");
 
@@ -768,7 +916,10 @@ static void loadCachedLevels(const std::string& name, const PackFile& f, Loaded*
     std::vector<std::vector<uint8_t>> levels;
     if (fread(&hd, sizeof hd, 1, in) == 1 && !memcmp(hd.magic, kMipsMagic, 8) && hd.size == size && hd.mtime == mtime &&
         hd.w == uint32_t(L->w) && hd.h == uint32_t(L->h) && hd.blocks == uint32_t(L->blocks) &&
-        hd.first == uint32_t(first) && hd.count == uint32_t(full - first)) {
+        hd.first == uint32_t(first) && hd.count == uint32_t(full - first) &&
+        // Levels made before the original was seen (SMS_TEXTURE_PACK_PRELOAD=all)
+        // are made again once it has been.
+        ((hd.flags & MIPS_ORIGINAL) || L->original.empty())) {
         int lw = std::max(1, L->w >> first), lh = std::max(1, L->h >> first);
         for (int i = first; i < full; i++) {
             std::vector<uint8_t> lv(blockLevelBytes(L->blocks, lw, lh));
@@ -794,6 +945,7 @@ static void storeCachedLevels(const std::string& name, const PackFile& f, const 
     hd.blocks = uint32_t(L.blocks);
     hd.first = uint32_t(L.first);
     hd.count = uint32_t(L.levels.size());
+    hd.flags = L.original.empty() ? 0 : MIPS_ORIGINAL;
     const std::string path = dir + "/" + name + ".mips", part = path + ".part";
     FILE* out = fopen(part.c_str(), "wb");
     if (!out) return;
@@ -822,6 +974,16 @@ static void storeCachedLevels(const std::string& name, const PackFile& f, const 
     if (!ok || ec) std::filesystem::remove(part, ec);
 }
 
+// L->scale, as finishUpload finds it, and L->mipmapped, from `name`.
+static void originalScale(const std::string& name, Loaded* L) {
+    unsigned w = 0, h = 0;
+    int end = 0;
+    if (sscanf(name.c_str(), "tex1_%ux%u%n", &w, &h, &end) != 2 || !w || !h) return;
+    L->mipmapped = !name.compare(size_t(end), 3, "_m_");
+    while (L->scale < 6 && (w << (L->scale + 1)) <= unsigned(L->w) && (h << (L->scale + 1)) <= unsigned(L->h))
+        L->scale++;
+}
+
 // `whole`: also the compressed levels completeChain makes, else only the
 // pack's and the cached ones (RGBA images are always completed: they are
 // decoded anyway).
@@ -829,6 +991,11 @@ static Loaded* decode(const std::string& name, bool whole, bool cached = true) {
     const PackFile& f = s_index.at(name);
     Loaded* L = new Loaded;
     L->arbitrary = f.arbitrary;
+    {
+        std::lock_guard<std::mutex> lk(s_originalMu);
+        auto it = s_original.find(name);
+        if (it != s_original.end()) L->original = it->second;
+    }
     if (endsWith(f.path, ".dds") || endsWith(f.path, ".DDS")) {
         if (!decodeDds(f.path, L)) {
             logmsg("texture pack: cannot read %s (not a DDS of a supported format)", f.path.c_str());
@@ -848,6 +1015,7 @@ static Loaded* decode(const std::string& name, bool whole, bool cached = true) {
             }
         }
         if (cached && !L->failed && L->compressed) loadCachedLevels(name, f, L);
+        originalScale(name, L);
         if (whole || !L->compressed) completeChain(L);
         return L;
     }
@@ -873,6 +1041,7 @@ static Loaded* decode(const std::string& name, bool whole, bool cached = true) {
         L->levels.emplace_back(m, m + size_t(mw) * mh * 4);
         stbi_image_free(m);
     }
+    originalScale(name, L);
     completeChain(L);
     return L;
 }
