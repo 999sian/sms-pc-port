@@ -378,10 +378,23 @@ void preempt_check()
 		reschedule(false);
 }
 
+// port_os_run_lower: the thread that stepped down, its priority, and until when.
+OSThread* g_lower_self;
+OSPriority g_lower_priority;
+double g_lower_until;
+
+void lower_restore()
+{
+	g_lower_self->priority = g_lower_priority;
+	g_lower_self = NULL;
+}
+
 void deliver_irqs()
 {
 	if (g_in_irq)
 		return;
+	if (g_lower_self && mono_seconds() >= g_lower_until)
+		lower_restore();
 	g_in_irq = true;
 	g_irq_kicks.store(0);
 	for (size_t i = 0; i < g_sources.size(); i++)
@@ -580,6 +593,26 @@ extern "C" s32 OSEnableScheduler(void)
 }
 
 extern "C" void OSYieldThread(void) { reschedule(true); }
+
+// Let the runnable threads below the current one's priority run, as they do
+// while it waits for a retrace, until they all block or `seconds` have passed
+// (checked when interrupts are delivered: a thread is never cut off between
+// OS calls). For a frame that ends late (port_vi_frame_wait), which skips
+// that wait: on a host too slow for the frame rate, threads such as the
+// portal movie's THP decoder (priority 20, under the game's 16) never ran.
+extern "C" void port_os_run_lower(double seconds)
+{
+	OSThread* self = g_cur;
+	if (g_in_irq || g_sched_disabled || g_lower_self)
+		return;
+	g_lower_self     = self;
+	g_lower_priority = self->priority;
+	g_lower_until    = mono_seconds() + seconds;
+	self->priority   = OS_PRIORITY_MAX + 1;
+	reschedule(false);
+	if (g_lower_self == self)
+		lower_restore();
+}
 
 extern "C" int OSCreateThread(OSThread* t, void* (*func)(void*), void* param, void* stack, u32 stackSize,
                               OSPriority prio, u16 attr)
