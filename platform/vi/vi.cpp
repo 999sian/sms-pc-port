@@ -310,13 +310,20 @@ extern "C" s32 port_vi_frame_wait(s32 due, u16 frames)
 	const double entry = seconds_now();
 	if (ready > 0)
 		work += (entry - ready - (GXPC_LastPresentSeconds ? GXPC_LastPresentSeconds() : 0) - work) * 0.1;
-	while ((s32)(VIGetRetraceCount() - due) < 0)
+	const int speed = GXPC_GetSpeed ? GXPC_GetSpeed() : 1;
+	const double period = frames * g_period_ns * 1e-9 / (speed > 0 ? speed : 1);
+	bool waited = false;
+	while ((s32)(VIGetRetraceCount() - due) < 0) {
 		VIWaitForRetrace();
+		waited = true;
+	}
+	// The wait is when threads below the game's priority run (the portal
+	// movie's decoder); a late frame still gives them up to a quarter frame.
+	if (!waited)
+		port_os_run_lower(period / 4);
 	const s32 now = (s32)VIGetRetraceCount();
 	if (now - due > max_behind)
 		due = now;
-	const int speed = GXPC_GetSpeed ? GXPC_GetSpeed() : 1;
-	const double period = frames * g_period_ns * 1e-9 / (speed > 0 ? speed : 1);
 	const bool skip = now - due >= frames && now - shown < max_unshown && work < period;
 	if (!skip)
 		shown = now;

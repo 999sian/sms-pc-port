@@ -74,6 +74,10 @@ The plaza's looping portal movie still decodes and plays, since its frames are i
 `thp-06` keeps each portal's authored placeholder dimensions until a decoded frame is bound, then resizes all three Y/U/V planes together.
 This prevents the host texture decoder from reading movie-sized images out of a small placeholder, especially with HD replacements.
 
+The video decoder thread runs at priority 20, below the game thread's 16, so it only decodes while the game thread waits.
+A frame that ends late skips its retrace wait (`port_vi_frame_wait`), so it gives lower-priority threads up to a quarter frame instead (`port_os_run_lower`).
+Without that, a host too slow for the frame rate left the portal movie stuck on one frame.
+
 `tools/regress/portal.py` checks skipped cutscenes, the authored placeholder, and three successive decoded frames' sizes and addresses under gdb:
 
 ```sh
