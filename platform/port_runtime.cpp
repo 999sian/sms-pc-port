@@ -495,6 +495,38 @@ static void* map_exact(void* want, size_t size)
 		munmap(p, size);
 	return MAP_FAILED;
 }
+
+#if UINTPTR_MAX > 0xFFFFFFFFu
+// Map `size` bytes below 4 GiB (below 2 GiB where possible), or NULL.
+static void* low_map(size_t size, int prot)
+{
+#ifdef MAP_32BIT
+	// Linux: below 2 GiB. macOS: below 4 GiB.
+	void* p = mmap(NULL, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+	if (p != MAP_FAILED) {
+		if ((uintptr_t)p + size <= 0x100000000u)
+			return p;
+		munmap(p, size);
+	}
+#endif
+	// Walk hint addresses from 256 MiB up to 2 GiB. Darwin places a hinted
+	// mapping in the first free range at or above the hint, so take any
+	// placement that still ends below 2 GiB.
+	for (uintptr_t at = 0x10000000u; at + size <= 0x80000000u; at += 0x100000u) {
+		void* q = mmap((void*)at, size, prot, MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_FIXED_NOREPLACE
+			| MAP_FIXED_NOREPLACE
+#endif
+			, -1, 0);
+		if (q == MAP_FAILED)
+			continue;
+		if ((uintptr_t)q >= at && (uintptr_t)q + size <= 0x80000000u)
+			return q;
+		munmap(q, size);
+	}
+	return NULL;
+}
+#endif
 #endif
 
 static void map_mem1()
@@ -570,20 +602,39 @@ void* port_low_alloc(unsigned long size)
 	}
 	return NULL;
 #else
-#ifdef MAP_32BIT
-	void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-	if (p != MAP_FAILED)
-		return p;
-#endif
-	static uintptr_t next = 0x40000000u;
-	for (int tries = 0; tries < 4096 && next + size <= 0x80000000u; tries++) {
-		void* want = (void*)next;
-		next += (size + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
-		void* q = map_exact(want, size);
-		if (q == want)
-			return q;
+	// As on Windows, the first call (the boot thread's stack, before any
+	// window exists) reserves a pool that later allocations are carved from.
+	// On macOS, with PAGEZERO shrunk, the low 4 GiB is the first free address
+	// space, so the GPU driver and malloc's large blocks (a texture pack's
+	// decoded textures) fill it once rendering starts, leaving none for the
+	// next thread stack (issue #146).
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static bool reserved;
+	static char* pool;
+	static size_t poolSize, poolUsed;
+	pthread_mutex_lock(&lock);
+	if (!reserved) {
+		reserved = true;
+		for (size_t mb = 128; mb >= 32 && !pool; mb /= 2)
+			if ((pool = (char*)low_map(mb << 20, PROT_NONE)))
+				poolSize = mb << 20;
+		if (pool)
+			port_log("[port] low memory pool: %zu MiB at %p\n", poolSize >> 20, pool);
+		else
+			port_log("[port] cannot reserve a low memory pool\n");
 	}
-	return NULL;
+	// 64 KiB grain, and the untouched grain after each block is a guard.
+	const size_t grain = (size + 0xFFFFu) & ~(size_t)0xFFFFu;
+	void* p = NULL;
+	if (pool && poolUsed + grain <= poolSize && mprotect(pool + poolUsed, grain, PROT_READ | PROT_WRITE) == 0) {
+		p = pool + poolUsed;
+		poolUsed += grain + 0x10000u;
+	}
+	if (!p && !(p = low_map(size, PROT_READ | PROT_WRITE)))
+		port_log("[port] no memory below 4 GiB for %lu bytes (pool: %zu of %zu KiB used)\n", size,
+			poolUsed >> 10, poolSize >> 10);
+	pthread_mutex_unlock(&lock);
+	return p;
 #endif
 }
 
