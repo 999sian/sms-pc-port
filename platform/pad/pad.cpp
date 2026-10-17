@@ -83,16 +83,22 @@ __attribute__((weak)) int GXPC_RequestQuit(void);
 }
 
 // PC camera options, read by the camera code (decomp-patches/zzz-pc-camera.patch):
-//   SMS_CAMERA_INVERT_X / _Y   flip the C-stick (and mouse) on that axis
+//   SMS_CAMERA_INVERT_X / _Y   flip the C-stick (and mouse) on that axis; _Y
+//                              also flips FLUDD's aim while spraying in place
+//                              (decomp-patches/zzz-camera-03-fludd-aim-invert-y.patch)
 //   SMS_CAMERA_SPEED=percent   scales manual camera rotation (100 = retail)
 //   SMS_FREE_CAMERA=1          the camera stays where it is put (no auto swing-back)
 //   SMS_MOUSE_SENSITIVITY=%    mouse look speed, when the GX layer captures the mouse
+//   SMS_CLOSE_CAMERA_CSTICK=1  the C-stick turns (and aims FLUDD in) the Y close-up
+//                              camera too (decomp-patches/zzz-camera-04-close-camera-cstick.patch)
 //   SMS_MOUSE_ORBIT=0          the mouse's up/down acts as the C-stick's again
 //                              (nearer and lower, or further and higher) instead
 //                              of tilting the camera around Mario
 // and the mouse wheel zooms the camera in and out (decomp-patches/zzz-camera-02).
 extern "C" {
 int port_free_camera      = 0;
+int port_camera_invert_y  = 0;
+int port_close_camera_cstick = 0;
 f32 port_camera_speed_x   = 1.0f;
 f32 port_camera_speed_y   = 1.0f;
 // Mouse orbit (zzz-camera-02): whether the mouse's up/down tilts the camera,
@@ -236,6 +242,8 @@ bool g_inited;
 // SMS_CAMERA_INVERT_X / SMS_CAMERA_INVERT_Y=1 flip the C-stick, which only
 // turns the camera.
 bool g_invert_cx, g_invert_cy;
+// SMS_CLOSE_CAMERA_CSTICK=1 (port_close_camera_cstick)
+bool g_closeCameraCStick;
 // mouse look (see above): its speed, and the motion not yet given to the camera
 float g_mouseSens = 1.0f;
 int g_mouseDX, g_mouseDY;
@@ -609,6 +617,9 @@ void init()
 	parse_bindings(kDefaultBindings, "defaults");
 	g_invert_cx = env_on("SMS_CAMERA_INVERT_X");
 	g_invert_cy = env_on("SMS_CAMERA_INVERT_Y");
+	g_closeCameraCStick = env_on("SMS_CLOSE_CAMERA_CSTICK");
+	if (g_closeCameraCStick)
+		port_log("[pad] the C-stick turns the close-up camera too\n");
 	if (g_invert_cx || g_invert_cy)
 		port_log("[pad] camera inverted:%s%s\n", g_invert_cx ? " X" : "", g_invert_cy ? " Y" : "");
 	const char* path = getenv("SMS_BINDINGS");
@@ -844,10 +855,16 @@ extern "C" __attribute__((weak)) int port_trace_pad_read(struct PADStatus* statu
 
 extern "C" u32 PADRead(PADStatus* status)
 {
-	// A .dtm movie (platform/trace, SMS_MOVIE) replaces live input.
-	if (port_trace_pad_read && port_trace_pad_read(status))
+	// A .dtm movie (platform/trace, SMS_MOVIE) replaces live input, and is
+	// played as recorded: the game code's own inversion is off too.
+	if (port_trace_pad_read && port_trace_pad_read(status)) {
+		port_camera_invert_y     = 0;
+		port_close_camera_cstick = 0;
 		return PAD_CHAN0_BIT;
+	}
 	init();
+	port_camera_invert_y     = g_invert_cy;
+	port_close_camera_cstick = g_closeCameraCStick;
 	static bool autoInited;
 	if (!autoInited) {
 		autoInited = true;
