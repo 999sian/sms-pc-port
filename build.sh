@@ -4,6 +4,7 @@
 # Builds the port for this computer into build/<os>-<arch>/:
 #   Linux    build/linux-32/sms       (SMS_ARCH=64: build/linux-64/sms)
 #   macOS    build/macos-64/sms       (x86_64, runs under Rosetta on Apple Silicon)
+#            build/macos-arm64/sms    (SMS_ARCH=arm64: native Apple Silicon)
 #   Windows  build/windows-64/sms.exe (MSYS2 MINGW64 shell, or build.cmd)
 # With a disc image (the argument, SMS_DISC_IMAGE, or the one image in rom/)
 # it also builds a copy that has the game's files inside and needs no image:
@@ -12,6 +13,8 @@
 # JOBS=n limits parallel compiler jobs. SMS_ECLIPSE=1 builds Super Mario
 # Eclipse in, into build/<os>-<arch>-eclipse/ (docs/ECLIPSE.md). See BUILD.md.
 # SMS_GX_BUILD_TESTS=ON also configures platform/gx's self-tests (for CI).
+# SMS_GX_VULKAN=ON|OFF builds the optional Vulkan backend in or leaves it out
+# (default: on Linux and macOS; docs/VULKAN.md).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -54,7 +57,9 @@ setup_linux() {
 # SDL2.framework (Homebrew's sdl2 is arm64-only on Apple Silicon).
 setup_macos() {
   need git cmake make patch python3 clang++ curl
-  if [[ "$(uname -m)" == arm64 ]] && ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+  local osx_arch=x86_64
+  [[ "$sms_arch" != arm64 ]] || osx_arch=arm64
+  if [[ "$osx_arch" == x86_64 && "$(uname -m)" == arm64 ]] && ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
     sms_die "Rosetta 2 is required on Apple Silicon (the game is an x86_64 program): softwareupdate --install-rosetta"
   fi
 
@@ -89,14 +94,44 @@ setup_macos() {
     hdiutil detach "$mnt" -quiet || true
   fi
 
+  # MoltenVK, the Vulkan backend's library on macOS (renderer = vulkan),
+  # unless SMS_GX_VULKAN=OFF: beside the executable and in SMS.app's
+  # Frameworks. A universal dylib; build/deps/ keeps it. Without it the game
+  # uses OpenGL.
+  local mvk_ver=1.4.2
+  local mvk_sha=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+  mvk_dylib=""
+  if [[ "${SMS_GX_VULKAN:-ON}" != OFF ]]; then
+    mvk_dylib="$PWD/build/deps/MoltenVK-$mvk_ver/libMoltenVK.dylib"
+    if [[ ! -f "$mvk_dylib" ]]; then
+      echo "Fetching MoltenVK $mvk_ver into build/deps/ ..."
+      mkdir -p "build/deps/MoltenVK-$mvk_ver"
+      local tar="build/deps/MoltenVK-$mvk_ver.tar"
+      if curl -fsSL -o "$tar.part" "https://github.com/KhronosGroup/MoltenVK/releases/download/v$mvk_ver/MoltenVK-macos.tar" &&
+         echo "$mvk_sha  $tar.part" | shasum -a 256 -c - >/dev/null; then
+        tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 5 \
+          MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib || true
+        tar -xf "$tar.part" -C "build/deps/MoltenVK-$mvk_ver" --strip-components 1 MoltenVK/LICENSE || true
+      fi
+      rm -f "$tar.part"
+    fi
+    if [[ -f "$mvk_dylib" ]]; then
+      cmake_args+=(-DSMS_MOLTENVK_DYLIB="$mvk_dylib")
+    else
+      echo "warning: could not fetch MoltenVK $mvk_ver; renderer = vulkan will fall back to OpenGL" >&2
+      mvk_dylib=""
+    fi
+  fi
+
   # A CMake tree configured for another architecture cannot be reused.
-  if [[ -f "$bdir/CMakeCache.txt" ]] && ! grep -q 'CMAKE_OSX_ARCHITECTURES:STRING=x86_64' "$bdir/CMakeCache.txt"; then
-    echo "Removing $bdir (it was not configured for x86_64)"
+  if [[ -f "$bdir/CMakeCache.txt" ]] && ! grep -q "CMAKE_OSX_ARCHITECTURES:STRING=$osx_arch\$" "$bdir/CMakeCache.txt"; then
+    echo "Removing $bdir (it was not configured for $osx_arch)"
     rm -rf "$bdir"
   fi
-  cmake_args+=(-DCMAKE_OSX_ARCHITECTURES=x86_64
+  cmake_args+=(-DCMAKE_OSX_ARCHITECTURES=$osx_arch
                -DCMAKE_C_COMPILER="$cc"
                -DCMAKE_CXX_COMPILER="$cxx"
+               -DCMAKE_RANLIB=/usr/bin/ranlib
                -DSMS_SDL2_FRAMEWORK="$sdl2_fw")
 }
 
@@ -109,6 +144,9 @@ setup_windows() {
 }
 
 "setup_$sms_os"
+# SMS_GX_VULKAN=ON|OFF overrides the Vulkan backend's default (on Linux and macOS);
+# without it, renderer = vulkan falls back to OpenGL
+[[ -z "${SMS_GX_VULKAN:-}" ]] || cmake_args+=(-DSMS_GX_VULKAN="$SMS_GX_VULKAN")
 
 disc="${1:-${SMS_DISC_IMAGE:-}}"
 [[ -n "$disc" || "$eclipse" == 1 ]] || disc=$(sms_find_rom)
@@ -125,17 +163,20 @@ fi
 # Windows runs it as a shell script whose forks can fail (e.g. Windows 7).
 [[ "$(git -C decomp rev-parse HEAD 2>/dev/null)" == "$(git rev-parse :decomp)" ]] || git submodule update --init decomp
 cmake -S . -B "$bdir" ${cmake_args[@]+"${cmake_args[@]}"} \
-  -DSMS_ARCH="$sms_arch" -DSMS_GX_BUILD_TESTS="${SMS_GX_BUILD_TESTS:-OFF}" -DSMS_BUNDLE_DISC="$disc"
+  -DSMS_ARCH="${sms_arch/arm64/64}" -DSMS_GX_BUILD_TESTS="${SMS_GX_BUILD_TESTS:-OFF}" -DSMS_BUNDLE_DISC="$disc"
 cmake --build "$bdir" --target sms --parallel "$(sms_jobs)"
 if [[ "$sms_os" == macos ]]; then
   # The executable finds SDL2.framework beside itself (@executable_path).
   rm -rf "$bdir/SDL2.framework"
   cp -R "$sdl2_fw" "$bdir/SDL2.framework"
+  # and libMoltenVK.dylib, where glvk looks for it (SMS_VK_LIBRARY overrides)
+  rm -f "$bdir/libMoltenVK.dylib"
+  [[ -z "$mvk_dylib" ]] || cp "$mvk_dylib" "$bdir/libMoltenVK.dylib"
 fi
 
 exe="$bdir/sms$sms_exe_suffix"
 echo
-echo "Built $exe ($sms_os, $sms_arch-bit)"
+if [[ "$sms_arch" == arm64 ]]; then echo "Built $exe ($sms_os, native arm64)"; else echo "Built $exe ($sms_os, $sms_arch-bit)"; fi
 if [[ -n "$disc" && "${SMS_STANDALONE:-1}" == 0 ]]; then
   echo "Play: ./run.sh \"$disc\""
 elif [[ -n "$disc" ]]; then
