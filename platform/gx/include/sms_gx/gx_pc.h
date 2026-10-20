@@ -203,7 +203,9 @@ int GXPC_ReadXFB(const void* xfb, uint8_t* rgba, int* w, int* h);
 // Extensions' text in the window (gx_ext_overlay.cpp): `panel` is the notice
 // near the top or the status panel in the top right; lines split at '\n',
 // "" or NULL hides it. Any thread; only a window shows it, not SMS_SHOTS.
-enum { GXPC_EXT_OVERLAY_NOTICE, GXPC_EXT_OVERLAY_STATUS, GXPC_EXT_OVERLAY_PANELS };
+// The banner is big text in the middle of the window (a server mod's: a race's
+// countdown, its winner); a text starting "#rrggbb " is drawn in that colour.
+enum { GXPC_EXT_OVERLAY_NOTICE, GXPC_EXT_OVERLAY_STATUS, GXPC_EXT_OVERLAY_BANNER, GXPC_EXT_OVERLAY_PANELS };
 void GXPC_ExtOverlaySet(int panel, const char* text);
 
 // Names over other players (multiplayer, gx_ext_overlay.cpp): each label's
@@ -216,6 +218,38 @@ typedef struct GXPCLabel {
     float x, y, alpha;
 } GXPCLabel;
 void GXPC_ExtOverlayLabels(const GXPCLabel* labels, int count);
+
+// Native mods' drawing (ext/modapi, gx_mod_layer.cpp): triangles in canvas
+// units (the game's picture, canvasW x canvasH from its top left), drawn at
+// the window's resolution over the picture and under the port's menus. Each
+// batch is `count` vertices from `first` (triangles), sampling `image` (0:
+// none) and kept inside its clip rectangle (canvas units; clip[2] < 0: none).
+// A submission replaces the last; it is drawn on every present until the
+// next. Any thread; only a window shows it, not SMS_SHOTS.
+typedef struct GXPCModVertex {
+    float x, y, u, v;
+    uint8_t rgba[4];
+} GXPCModVertex;
+typedef struct GXPCModBatch {
+    uint32_t first, count, image;
+    float clip[4];
+} GXPCModBatch;
+void GXPC_ModLayerSubmit(const GXPCModVertex* v, int nv, const GXPCModBatch* b, int nb, float canvasW, float canvasH);
+// The canvas for the next submission: 480 high, as wide as the picture.
+void GXPC_ModLayerCanvas(float* w, float* h);
+// Images for the batches: RGBA8 pixels (copied), or a file stb_image reads;
+// 0 on failure. Uploaded on the GL thread when first drawn. Any thread.
+uint32_t GXPC_ModImageCreate(const uint8_t* rgba, int w, int h);
+uint32_t GXPC_ModImageLoad(const char* path, int* w, int* h);
+void GXPC_ModImageFree(uint32_t image);
+// Keys for the native mods: the hook sees every key event the port's own
+// menus and keys leave, before the controls; returning non-zero keeps it from
+// them. Called on the game thread (in PADRead). mods: 1 shift, 2 ctrl, 4 alt.
+typedef int (*GXPCKeyHook)(int scancode, int down, int repeat, int mods);
+void GXPC_SetKeyHook(GXPCKeyHook hook);
+// SDL key names and scancodes: "F3", "Space", "A"; -1 / "" when unknown.
+int GXPC_KeyFromName(const char* name);
+const char* GXPC_KeyName(int scancode);
 
 // A picture shown in place of the texture whose data the game keeps at `data`
 // (gx_texture.cpp): RGBA8, w x h, row 0 at the top, drawn with mipmaps at the

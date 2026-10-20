@@ -300,12 +300,18 @@ enum OverlaySlot {
     OVERLAY_STATE_TOAST,
     OVERLAY_EXT_NOTICE,  // extensions' text (gx_ext_overlay.cpp)
     OVERLAY_EXT_STATUS,
+    OVERLAY_EXT_BANNER,
     OVERLAY_EXT_LABEL,   // names over players: GXPC_MAX_LABELS slots from here
     OVERLAY_SLOTS = OVERLAY_EXT_LABEL + 8
 };
 // Where GXPC_PresentXFB last put the game's picture in the window (from its top left).
 struct PresentRect { int x, y, w, h; };
 PresentRect lastPresentRect();
+// A GL program from GLSL 330 sources (vertex, fragment), its output o_color.
+unsigned compileInternalProgram(const char* vs, const char* fs);
+// Native mods' drawing (gx_mod_layer.cpp), on the GL thread over the presented
+// picture, under the port's own menus.
+void modLayerRender(int winW, int winH);
 void drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH);
 // SMS_WINDOW_SHOTS: the window as shown, menus included, at GX frame `frame` (GL thread, before the swap).
 void captureWindow(uint32_t frame, int w, int h);

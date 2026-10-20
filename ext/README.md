@@ -8,6 +8,7 @@ They are the start of a code-mod framework for the port: a new feature that need
 | [`core/`](core/port_ext.cpp) | the registry: the game's hooks call each registered extension in turn |
 | [`multiplayer/`](multiplayer/README.md) | up to eight players in one game over the network |
 | [`demo/`](demo/README.md) | plays Mario from a script, as a player holds the controller, for trailers and footage |
+| [`modapi/`](modapi/README.md) | native mods: loads mods from `mods/` (shared libraries) and turns these hooks into their events ([MODDING.md](https://github.com/chasem-dev/sms-mod-sdk/blob/main/docs/MODDING.md)) |
 
 ## The hooks
 
@@ -34,6 +35,10 @@ An extension fills in a `PortExtension` with the hooks it needs, leaving the res
 | `objectMove` | an object is about to move this tick, and has (`JDrama::TViewObj::testPerform`) | change what it decides by (`gpMarioPos`) until it has moved |
 | `objectHit` | the player or their water hits an object | return 1 to stop the hit |
 | `particleEmit` | an effect is asked of Mario's particle manager (`TMarioParticleManager::emit` and its kin) | note it (multiplayer shows the player's at them in the other games) |
+| `camera` | the game camera is about to make this tick's view (`CPolarSubCamera::perform`) | change the eye, the point looked at, the field of view |
+| `playerStatus` | `TMario::changePlayerStatus` | change the status, or return 1 to refuse it |
+| `playerDamage` | `TMario::decHP` | change the amount, or return 1 to stop it |
+| `shineCollected` | `TFlagManager::setShineFlag` sets a Shine's flag for the first time | note it |
 
 Every hook runs on the game thread inside the game's own steps, so an extension uses the game's globals (`gpApplication`, `gpMarDirector`, `gpMarioOriginal`, `TFlagManager`) as the game does there.
 With no extension switched on, each hook is a loop over nothing.
@@ -50,9 +55,10 @@ An extension is a folder `ext/<name>/` with:
   }
   ```
   Game code's `new` allocates from the game's current JKR heap: allocate in `stageSetup` for things that belong to a stage, and keep fixed arrays for the rest.
-- optionally `net/*.cpp` and `sync/*.cpp`: platform code, built into the executable with the host's compiler settings (C++11 and the host's libraries, sockets and threads included). Keep the two halves apart behind a small C header, as multiplayer does with [`mp_game_api.h`](multiplayer/mp_game_api.h).
+- optionally `net/*.cpp`, `sync/*.cpp` and `host/*.cpp`: platform code, built into the executable with the host's compiler settings (C++11 and the host's libraries, sockets and threads included). Keep the two halves apart behind a small C header, as multiplayer does with [`mp_game_api.h`](multiplayer/mp_game_api.h).
 - `tests/` folders, left out of the game build, for host tests.
 
-[`ext.cmake`](ext.cmake) picks up every `ext/*/game`, `ext/*/net` and `ext/*/sync` source by itself.
+[`ext.cmake`](ext.cmake) picks up every `ext/*/game`, `ext/*/net`, `ext/*/sync` and `ext/*/host` source by itself.
+Features that need not be built into the game belong in a native mod instead ([MODDING.md](https://github.com/chasem-dev/sms-mod-sdk/blob/main/docs/MODDING.md)), which players install and switch on and off themselves.
 A feature that needs a hook the game does not have yet adds it to `port_ext.h`, `core/port_ext.cpp` and the hooks patch, each hook general enough for other extensions to use.
 On screen, `GXPC_ExtOverlaySet` (`platform/gx`) shows a notice near the top of the window and a status panel at its right.
